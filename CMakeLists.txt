@@ -4,6 +4,7 @@ project(zlink VERSION 0.1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # ── Dependencies ────────────────────────────────────────────────────────
@@ -43,6 +44,13 @@ target_link_libraries(zlink_server PRIVATE zlink_core)
 
 # ── Examples ───────────────────────────────────────────────────────────
 add_subdirectory(examples/libmath)
+
+# ── CUDA examples (optional — requires CUDA toolkit) ───────────────────
+# Build with: cmake -DZLINK_CUDA_EXAMPLES=ON ..
+option(ZLINK_CUDA_EXAMPLES "Build CUDA RPC examples (requires CUDA toolkit)" OFF)
+if(ZLINK_CUDA_EXAMPLES)
+    add_subdirectory(examples/cuda)
+endif()
 
 # ── Tests ──────────────────────────────────────────────────────────────
 enable_testing()

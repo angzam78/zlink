@@ -1,0 +1,165 @@
+cmake_minimum_required(VERSION 3.20)
+
+# ── CUDA examples ─────────────────────────────────────────────────────
+# The server targets require the CUDA toolkit (runs on the GPU machine).
+# The shim targets do NOT require CUDA — they only need the CUDA headers
+# for the type definitions (CUcontext, CUstream, etc.).
+#
+# Build scenarios:
+#   GPU machine:  cmake -DZLINK_CUDA_EXAMPLES=ON ..  (builds everything)
+#   CPU machine:  cmake -DZLINK_CUDA_EXAMPLES=ON ..
+#                 (builds shim only if CUDA headers available;
+#                  server targets skipped if nvcc not found)
+
+find_package(CUDAToolkit)
+
+if(CUDAToolkit_FOUND)
+    # ── CUDA server v3 (original 38 functions) ─────────────────────────
+    add_executable(cuda_server_v3 cuda_server_v3.cpp)
+    target_link_libraries(cuda_server_v3 PRIVATE
+        zlink_core
+        CUDA::cuda_driver
+    )
+    target_include_directories(cuda_server_v3 PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+
+    # ── CUDA server v4 (full 48 functions, PyTorch-ready) ─────────────
+    add_executable(cuda_server_v4 cuda_server_v4.cpp)
+    target_link_libraries(cuda_server_v4 PRIVATE
+        zlink_core
+        CUDA::cuda_driver
+    )
+    target_include_directories(cuda_server_v4 PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+else()
+    message(STATUS "CUDA toolkit not found — server targets skipped")
+    message(STATUS "Build the server on the GPU machine with CUDA installed")
+endif()
+
+# ════════════════════════════════════════════════════════════════════════
+# libcuda.so.1 — zlink CUDA Driver API shim
+# ════════════════════════════════════════════════════════════════════════
+# This is the KEY deliverable: a shared library that replaces libcuda.so.1
+# on the CPU client machine. PyTorch loads "libcuda.so.1" via dlopen, and
+# the dynamic linker finds THIS library instead, because the directory
+# containing it is first in LD_LIBRARY_PATH.
+#
+# The shim:
+#   - Exports all cu* symbols (cuInit, cuMemAlloc, cuLaunchKernel, etc.)
+#   - Intercepts every call, translates virtual handles, and forwards
+#     via zlink RPC to cuda_server_v4 on the remote GPU machine
+#   - Does NOT link against the real CUDA driver — it REPLACES it
+#   - Defines its own CUDA type stubs (no cuda.h dependency)
+#   - Can be built on CPU-only machines (no CUDA toolkit needed)
+#
+# Usage on the CPU client:
+#   export ZLINK_SERVER=gpu-machine:14833
+#   export LD_LIBRARY_PATH=/path/to/zlink-cuda-runtime:$LD_LIBRARY_PATH
+#   python my_script.py
+#
+# The zlink-cuda-runtime directory contains:
+#   libcuda.so.1       (this shim)
+#   libcuda.so         → libcuda.so.1   (symlink)
+#   libnvidia-ml.so.1  (NVML shim)
+#   libnvidia-ml.so    → libnvidia-ml.so.1 (symlink)
+add_library(zlink_cuda_shim SHARED cuda_shim_pytorch.cpp)
+target_link_libraries(zlink_cuda_shim PRIVATE
+    zlink_core
+)
+target_include_directories(zlink_cuda_shim PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+# The shim must export all cu* symbols with default visibility
+# so that PyTorch can dlsym them after dlopen("libcuda.so.1")
+set_target_properties(zlink_cuda_shim PROPERTIES
+    OUTPUT_NAME "cuda"
+    PREFIX "lib"
+    SOVERSION "1"
+    VERSION "1.0.0"
+    POSITION_INDEPENDENT_CODE ON
+    CXX_VISIBILITY_PRESET "default"
+    VISIBILITY_INLINES_HIDDEN OFF
+)
+# Allow undefined symbols — the shim replaces libcuda.so, it doesn't link to it
+target_link_options(zlink_cuda_shim PRIVATE
+    -Wl,--allow-shlib-undefined
+)
+
+# ════════════════════════════════════════════════════════════════════════
+# libnvidia-ml.so.1 — zlink NVML shim
+# ════════════════════════════════════════════════════════════════════════
+# Minimal NVML (NVIDIA Management Library) shim. PyTorch and tools like
+# nvidia-smi load libnvidia-ml.so.1 to query GPU status, memory usage,
+# device names, etc. Without this shim, those queries fail silently or
+# raise errors.
+#
+# This shim returns reasonable defaults (1 GPU, server-reported memory)
+# and forwards queries to the zlink server where possible.
+add_library(zlink_nvidia_ml_shim SHARED nvidia_ml_shim.cpp)
+target_link_libraries(zlink_nvidia_ml_shim PRIVATE
+    zlink_core
+)
+target_include_directories(zlink_nvidia_ml_shim PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+set_target_properties(zlink_nvidia_ml_shim PROPERTIES
+    OUTPUT_NAME "nvidia-ml"
+    PREFIX "lib"
+    SOVERSION "1"
+    VERSION "1.0.0"
+    POSITION_INDEPENDENT_CODE ON
+    CXX_VISIBILITY_PRESET "default"
+    VISIBILITY_INLINES_HIDDEN OFF
+)
+target_link_options(zlink_nvidia_ml_shim PRIVATE
+    -Wl,--allow-shlib-undefined
+)
+
+# ── Legacy shim v2 (for reference / testing) ──────────────────────────
+# NOTE: cuda_shim_v2 has known compilation issues with newer zpp_bits.
+# It is disabled by default. Set ZLINK_BUILD_LEGACY_SHIM=ON to build it.
+option(ZLINK_BUILD_LEGACY_SHIM "Build legacy cuda_shim_v2" OFF)
+if(ZLINK_BUILD_LEGACY_SHIM AND CUDAToolkit_FOUND)
+    add_library(cuda_shim_v2 SHARED cuda_shim_v2.cpp)
+    target_link_libraries(cuda_shim_v2 PRIVATE
+        zlink_core
+    )
+    target_include_directories(cuda_shim_v2 PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CUDAToolkit_INCLUDE_DIRS}
+    )
+endif()
+
+# ════════════════════════════════════════════════════════════════════════
+# Install target: creates the zlink-cuda-runtime directory
+# ════════════════════════════════════════════════════════════════════════
+# After `cmake --install .`, the user gets:
+#   ${CMAKE_INSTALL_PREFIX}/zlink-cuda-runtime/
+#     libcuda.so.1        (CUDA Driver shim)
+#     libcuda.so          → libcuda.so.1
+#     libnvidia-ml.so.1   (NVML shim)
+#     libnvidia-ml.so     → libnvidia-ml.so.1
+#
+# Deploy this directory to the CPU client machine and:
+#   export LD_LIBRARY_PATH=/path/to/zlink-cuda-runtime:$LD_LIBRARY_PATH
+#   export ZLINK_SERVER=gpu-host:14833
+#   python my_script.py
+
+install(TARGETS zlink_cuda_shim zlink_nvidia_ml_shim
+    LIBRARY DESTINATION zlink-cuda-runtime
+)
+
+# Create versioned symlinks at install time
+install(CODE "
+    set(_dir \"\${CMAKE_INSTALL_PREFIX}/zlink-cuda-runtime\")
+    # libcuda.so → libcuda.so.1
+    execute_process(COMMAND \${CMAKE_COMMAND} -E create_symlink
+        libcuda.so.1 \"\${_dir}/libcuda.so\")
+    # libnvidia-ml.so → libnvidia-ml.so.1
+    execute_process(COMMAND \${CMAKE_COMMAND} -E create_symlink
+        libnvidia-ml.so.1 \"\${_dir}/libnvidia-ml.so\")
+    message(STATUS \"Created symlinks in \${_dir}\")
+    message(STATUS \"Deploy this directory to CPU client and set LD_LIBRARY_PATH\")
+")
