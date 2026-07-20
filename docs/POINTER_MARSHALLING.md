@@ -1,4 +1,7 @@
-# zlink Pointer Marshalling Design
+# zlink Pointer Marshalling
+
+This document describes how zlink handles pointer arguments across the
+network boundary — the hardest problem in GPU-over-IP.
 
 ## The Core Problem
 
@@ -28,202 +31,210 @@ Lupine's approach:
 
 Same fundamental approach as Lupine with the same limitations.
 
-## zlink's Approach: Shared Memory Plane (r3map-inspired)
+## zlink's Current Approach: Inline Host Sync in Pipeline Frames
 
-Instead of per-function marshalling, we make the **client's entire address
-space accessible** to the server through a shared memory plane, inspired by
-r3map's architecture.
+zlink currently handles pointer marshalling by packing host data inline into
+`pipeline_mem` frames. This is a simpler and more performant approach than
+on-demand fetching for the CUDA use case.
 
-### How r3map Works
+### How It Works Today
 
-r3map provides:
-
-1. **Backend interface**: `ReadAt(offset, buf) / WriteAt(offset, buf) / Size() / Sync()`
-   - Any resource can implement this: memory, file, S3, Redis, etc.
-
-2. **NBD (Network Block Device)**: The backend is exposed as a Linux block
-   device (/dev/nbd0). The kernel handles page faults on mmap'd regions
-   of this device by calling ReadAt/WriteAt on the backend.
-
-3. **Slice frontend**: `mmap` the NBD device to get a `[]byte` that
-   transparently fetches chunks from the backend on-demand.
-
-4. **Managed mounts**: Background push/pull for WAN optimization.
-   Pre-fetches chunks before they're needed; writes back dirty pages
-   periodically instead of synchronously.
-
-The result: **remote memory appears as local memory**. Accessing
-`remote_slice[1000:2000]` transparently fetches that range from the
-backend, which may be on another machine.
-
-### zlink's Adaptation
-
-We adapt r3map's architecture for the RPC use case:
+Instead of making the server fetch client data on demand (which requires
+extra round-trips), zlink packs the host data directly into the pipeline
+frame alongside the RPC calls:
 
 ```
-CLIENT                                  SERVER
-┌─────────────────────────┐             ┌─────────────────────────┐
-│ Application              │             │ Real .so function        │
-│   │                      │             │   │                      │
-│   ▼                      │             │   ▼                      │
-│ Shim intercepts call     │             │ translate_to_server()    │
-│   │                      │             │   │                      │
-│   ▼                      │             │   ▼                      │
-│ register_host_memory()   │             │ Server-local cache       │
-│   │                      │             │ (fetched on-demand       │
-│   ▼                      │             │  from client via         │
-│ shared_mem_plane         │  Backend    │  ReadAt/WriteAt)         │
-│   ├─ memory_backend ─────┼═══════════► │   ├─ rpc_backend         │
-│   │  (wraps real mem)    │  over RPC   │   │  (proxies to client)  │
-│   │                      │             │   │                      │
-│   ▼                      │             │   ▼                      │
-│ RPC call with ptr+region │──────────► │ Real cuMemcpyHtoD()      │
-│                          │             │   reads from local cache │
-│                          │             │   = same data as client  │
-└─────────────────────────┘             └─────────────────────────┘
+CLIENT                                            SERVER
+┌────────────────────────┐                        ┌────────────────────────┐
+│ cuMemcpyHtoD(VH(1),    │                        │ Receives pipeline_mem   │
+│   host_data, 256)      │                        │ frame:                 │
+│                        │                        │                        │
+│ enqueue_with_sync<9>(  │                        │ 1. Apply sync entries  │
+│   host_ptr, 256,       │                        │    → write to mirror   │
+│   VH(1), addr, 256)    │                        │    → client addr now   │
+│                        │                        │      has server data   │
+│ Pipeline batches:      │                        │                        │
+│  sync: [addr=0x7fff,   │  pipeline_mem frame    │ 2. Process RPC calls   │
+│         size=256,      │ ══════════════════►    │    translate VH→real   │
+│         data=...]      │                        │    translate client    │
+│  rpc:  [cuMemcpyHtoD  │                        │      ptr→server ptr    │
+│         (VH(1),       │                        │    call real cuMemcpy-  │
+│          0x7fff, 256)] │                        │      HtoD()            │
+│  manifest: [VH(1)←call0]│                       │                        │
+└────────────────────────┘                        └────────────────────────┘
 ```
 
-### Step-by-Step: cuMemcpyHtoD(dst, srcHost=0x7fff1234, 1024)
+### Step-by-Step: cuMemcpyHtoD with Inline Sync
 
-1. **Client shim** intercepts `cuMemcpyHtoD(dst, 0x7fff1234, 1024)`
-2. **Client shim** calls `register_host_memory(0x7fff1234, 1024, read_only)`
-   - Creates a `memory_backend` wrapping bytes at 0x7fff1234
-   - Registers it with the shared_mem_plane
-   - Returns region_id = 42
-3. **Client shim** sends RPC call with the pointer and region_id
-4. **Server** receives the call, sees srcHost=0x7fff1234, region_id=42
-5. **Server** calls `translate_to_server(0x7fff1234, 1024, 42)`
-   - Checks if chunk is already in local cache
-   - If not, calls `backend->read_at(offset=0, buf[1024])`
-   - The backend is an `rpc_backend` that sends a ReadAt request
-     back to the client over the existing transport
-   - Client's `memory_backend::read_at()` reads from real memory
-   - Data is copied into the server's local cache
-6. **Server** gets back a server-local pointer, e.g., 0x80004000
-7. **Server** calls `::cuMemcpyHtoD(remote_dst, 0x80004000, 1024)`
-   - The real CUDA function reads from the server-local cache
-   - The data is identical to what the client had at 0x7fff1234
-8. Function succeeds! No per-function marshalling code needed.
+1. **Client** calls `cu_memcpy_htod(pipe, dev_vh, host_data, byte_count)`
+2. This calls `pipe.enqueue_with_sync<9>(host_data, byte_count, dev_vh, client_addr, byte_count)`
+3. The pipeline:
+   - Queues a `pending_sync` with the host data copied from `host_data`
+   - Queues the RPC call `memcpy_htod(dev_vh, client_addr, byte_count)`
+4. When the pipeline flushes (at the next readback or explicit flush):
+   - Builds a `pipeline_mem` frame with sync entries, RPC calls, and handle
+     manifest
+   - Sends it in a single network round-trip
+5. **Server** receives the frame:
+   - Processes sync entries: `g_host_mirror.sync_page(client_addr, data)`
+     → stores data in server's mmap'd mirror region
+   - Processes RPC calls:
+     - Translates `dev_vh` → real device pointer via `g_vhandles.translate()`
+     - Translates `client_addr` → server-local address via `g_host_mirror.translate()`
+     - Calls real `cuMemcpyHtoD(real_dev_ptr, server_local_ptr, byte_count)`
+6. CUDA reads from the server-local pointer, which has the same data as
+   the client's original buffer
 
-### Step-by-Step: cuMemcpyDtoH(dstHost=0x7fff5678, src, 1024)
+### Step-by-Step: cuMemcpyDtoH with Inline Read
 
-1. **Client shim** intercepts `cuMemcpyDtoH(0x7fff5678, src, 1024)`
-2. **Client shim** registers the output buffer: `register_host_memory(0x7fff5678, 1024, writable=true)`
-3. **Client shim** sends RPC call
-4. **Server** calls `translate_to_server(0x7fff5678, 1024, 43)`
-   - Fetches the current contents (probably uninitialized/zero)
-   - Returns a server-local pointer
-5. **Server** calls `::cuMemcpyDtoH(local_ptr, remote_src, 1024)`
-   - CUDA writes into the server-local cache
-6. **Server** calls `mark_dirty(local_ptr, 1024)`
-7. **Server** calls `flush_dirty()`
-   - For each dirty chunk, calls `backend->write_at(offset, data)`
-   - The `rpc_backend` sends the data back to the client
-   - Client's `memory_backend::write_at()` copies into the real buffer
-8. Client's memory at 0x7fff5678 now contains the GPU data!
+1. **Client** calls `cu_memcpy_dtoh(pipe, host_data, dev_vh, byte_count)`
+2. This calls `pipe.call_readback_with_sync_read<10>(host_data, byte_count, client_addr, dev_vh, byte_count)`
+3. The pipeline:
+   - Queues a `pending_sync` (zero-fill, to create the mirror region)
+   - Queues a `pending_read` (requesting the data back after execution)
+   - Queues the RPC call
+   - Immediately flushes (readback forces flush)
+4. **Server** receives the frame:
+   - Processes sync entries (creates mirror region)
+   - Processes RPC call:
+     - Translates VH and client address
+     - Calls real `cuMemcpyDtoH(server_local_ptr, real_dev_ptr, byte_count)`
+     - GPU data is now in the server's mirror region
+   - Processes read requests: reads data from mirror region
+5. **Server** sends response with RPC results + read data
+6. **Client** parses response: read data is automatically copied to
+   `host_data` buffer
 
-### Step-by-Step: cuLaunchKernel(f, ..., kernelParams, ...)
+### The host_memory_mirror Class
 
-This is the hardest case: `kernelParams` is an `array of void* pointers`,
-each of which may point to host or device memory. This requires **deep
-pointer chasing**:
+The `host_memory_mirror` (in `memory.hpp`) is the server-side component that
+stores synced client data:
 
-1. **Client shim** intercepts `cuLaunchKernel(f, ..., params, ...)`
-2. **Client shim** registers the params array itself: `register_host_memory(params, N*sizeof(void*))`
-3. **Client shim** iterates over each param pointer:
-   - If it's a device pointer (found in ptr_map): no action needed
-   - If it's a host pointer: register the pointed-to data as a region
-4. **Client shim** sends RPC call with all region IDs
-5. **Server** translates the params array:
-   - `translate_to_server(params_addr, ...)` gets server-local params array
-   - For each pointer in the array:
-     - If device: translate via ptr_map
-     - If host: translate via shared_mem_plane
-6. **Server** calls `::cuLaunchKernel(f, ..., translated_params, ...)`
-7. After the kernel completes, flush dirty regions back to client
+- `register_region(client_base, size)` — Allocates a server-local mmap'd
+  region to mirror the client's address range
+- `sync_page(client_addr, data)` — Writes client data into the mirror region
+- `translate(client_addr)` — Returns the server-local address corresponding
+  to a client address, or `nullopt` if not registered
 
-## Comparison of Approaches
+The mirror region uses `mmap(MAP_ANONYMOUS | MAP_PRIVATE)`, so it's
+allocated from virtual memory without needing a file backing.
 
-| Aspect | Lupine (codegen) | zlink V1 (no marshalling) | zlink V2 (shared mem plane) |
-|--------|-------------------|---------------------------|-----------------------------|
-| Input pointers | Serialize in RPC msg | Broken (raw ptr) | Auto-fetch via ReadAt |
-| Output pointers | Deserialize from RPC msg | Broken (raw ptr) | Auto-writeback via WriteAt |
-| Inout pointers | Serialize + deserialize | Broken | Fetch + mark_dirty + flush |
-| String args | Serialize as bytes | Broken | Register as read-only region |
-| Deep pointers | Custom per-function | Broken | Recursive registration |
-| Arbitrary .so support | No (CUDA only) | No (broken ptrs) | Yes |
-| Codegen required | Yes | No | No |
-| Latency (small) | ~0.2ms | N/A | ~0.2ms (1 RTT for fetch) |
-| Latency (first access) | N/A | N/A | ~0.3ms (fetch on demand) |
-| Latency (cached) | N/A | N/A | ~0us (already local) |
-| WAN support | Poor (sync) | N/A | Good (bg push/pull) |
+### Auto-Registering on Sync
 
-## Optimization: Bulk Transfer vs On-Demand
-
-For large transfers (cuMemcpyHtoD/DtoH with megabytes of data),
-on-demand chunk fetching would be slow (1 RTT per 4K chunk).
-Instead, we use **explicit bulk transfer**:
+The `sync_page()` method in `memory_region.cpp` automatically registers a
+new region if the client address isn't already in a known region:
 
 ```cpp
-// Client side: for large HtoD copies, push all data immediately
-g_mem_plane.push(region_id, 0, span_of_all_data);
+std::error_code host_memory_mirror::sync_page(std::uintptr_t client_addr,
+                                               std::span<const std::byte> data) {
+    auto it = std::find_if(regions_.begin(), regions_.end(),
+        [&](const region& r) {
+            return client_addr >= r.client_base &&
+                   client_addr < r.client_base + r.size;
+        });
 
-// Server side: data is already in cache, translate returns immediately
-auto* local = g_mem_plane.translate_to_server(addr, size, region_id);
-// local points to already-cached data, no on-demand fetch needed
+    if (it == regions_.end()) {
+        // Auto-register: allocate a new mirror region for this address
+        register_region(client_addr & ~0xFFFULL, 65536);  // 64K aligned
+    }
+
+    // Now write the data into the mirror
+    // ...
+}
 ```
 
-This gives the same performance as explicit serialization for large
-transfers, while keeping the on-demand model for small/infrequent accesses.
+This means the client doesn't need to explicitly register regions before
+syncing — the first `host_sync` for an address range automatically creates
+the mirror.
 
-## Optimization: Background Push/Pull (r3map Managed Mounts)
+## Virtual Handles for Device Pointers
 
-For WAN deployments where RTT is high, r3map's managed mount API
-pre-fetches chunks before they're needed:
+Device pointers are handled differently from host pointers. They use the
+virtual handle system (see [CUDA_PIPELINE.md](CUDA_PIPELINE.md) for full
+details):
+
+- `cuMemAlloc` returns a virtual handle (VH) instead of a real device
+  pointer
+- Subsequent calls pass VH values as arguments
+- The server translates VH → real handle via `handle_table::translate()`
+- The encoding is safe: bit 63 is set for virtual handles, which never
+  appears in real user-space pointers
+
+## Kernel Launch: Deep Pointer Handling
+
+`cuLaunchKernel` is the hardest case because `kernelParams` is an array of
+`void*` pointers, each of which may point to device memory. In the current
+implementation (as seen in `cuda_test_server.cpp`):
 
 ```cpp
-// Start prefetching from the beginning of the region
-g_mem_plane.start_prefetch(region_id, priority_offset=0);
+// Server-side kernel launch handler:
+case 13: {  // launch_kernel
+    // ...
+    // Translate the function handle
+    real_func = (CUfunction)g_vhandles.translate(func_vh);
 
-// Start periodic writeback of dirty pages
-g_mem_plane.start_background_writeback(region_id, interval_ms=100);
+    // The args were sent via host_sync, already in the mirror region
+    // Translate the args client address to server-local
+    auto args_server = g_host_mirror.translate(args_client_addr);
+
+    // Each arg in kernelParams may be a device pointer (VH)
+    // We need to translate them
+    void* kernel_params[MAX_KERNEL_PARAMS];
+    for (int i = 0; i < n_args; i++) {
+        uint64_t* arg_ptr = (uint64_t*)(args_server_local + i * 8);
+        uint64_t arg_val = *arg_ptr;
+        if (zlink::is_virtual_handle(arg_val)) {
+            *arg_ptr = g_vhandles.translate(arg_val);
+        }
+    }
+
+    cuLaunchKernel(real_func, ...);
+}
 ```
 
-This hides latency by overlapping data transfer with computation.
+This approach walks the kernel args array on the server side, translating
+any virtual handles found in the argument slots. It works because:
 
-## Future: NBD Kernel Module Integration
+1. The client sends the args data via `host_sync` (inline in pipeline_mem)
+2. The server mirrors the data at a known server-local address
+3. The server walks the args, translating VH values to real device pointers
+4. CUDA receives real pointers and the kernel runs correctly
 
-The current implementation uses user-space caching. For even better
-performance, we could use r3map's NBD approach directly:
+## Comparison: Current vs Planned
 
-1. Client exposes its memory as an NBD server (via go-nbd or a C++ NBD impl)
-2. Server connects via /dev/nbdX
-3. Server mmaps the NBD device
-4. Kernel handles page faults automatically
-5. Zero user-space overhead for cached pages
+| Aspect | Current (inline sync) | Planned (on-demand) |
+|--------|----------------------|---------------------|
+| Input pointers | Inline in pipeline_mem frame | Auto-fetch via ReadAt |
+| Output pointers | Inline read in pipeline_mem response | Auto-writeback via WriteAt |
+| Extra round-trips | None (data is inline) | 1 RTT per on-demand fetch |
+| Code complexity | Simple (pack/unpack) | Complex (caching, coherence) |
+| Best for | LAN, moderate data sizes | WAN, sparse access patterns |
+| Implemented | Yes | Partially (framework exists) |
 
-This would eliminate the user-space caching overhead entirely,
-at the cost of requiring the nbd kernel module and root access.
+The inline approach is currently used because it gives the best performance
+for the common CUDA workload pattern (batch HtoD → compute → DtoH) with
+zero extra round-trips. The on-demand approach via `shared_mem_plane` and
+`chunk_cache` is implemented as a framework but not yet the default path
+for CUDA operations.
 
-## Protocol Extension: Region Metadata in RPC Frames
+## Future: On-Demand Access via Shared Memory Plane
 
-The current RPC protocol needs a small extension to carry region
-metadata alongside pointer arguments:
+The `shared_mem_plane` (in `shared_mem.hpp`) and `chunk_cache` (in
+`chunk_cache.hpp`) provide the infrastructure for on-demand access:
 
-```
-┌─────────────┬──────────────────────┬──────────────────────────┐
-│ RPC payload │ Region table (new!)  │ Region data (optional)   │
-│ (zpp_bits)  │ [id, addr, size, rw] │ [bulk push data]         │
-└─────────────┴──────────────────────┴──────────────────────────┘
-```
+1. **`backend` interface** — `ReadAt/WriteAt/Size/Sync`, matching r3map's Go
+   Backend
+2. **`memory_backend`** — Wraps local memory as a backend
+3. **`rpc_backend`** — Proxies ReadAt/WriteAt over the RPC transport
+4. **`shared_mem_plane`** — Coordinates client↔server memory access with
+   lazy fetching and background push/pull
 
-The region table tells the server which memory regions the client
-has registered, so it can set up the rpc_backend for on-demand
-access. For small regions, the data can be included inline (bulk
-push). For large regions, only the metadata is sent, and the
-server fetches on demand.
+When enabled, the server would fetch client data on-demand rather than
+requiring it to be pre-synced. This is beneficial for:
 
-This hybrid approach gives the best of both worlds:
-- Small data: inline in RPC message (low latency)
-- Large data: on-demand fetch (avoids blocking the RPC call)
-- Cached data: zero-copy (already in server's local cache)
+- WAN deployments where pre-syncing large buffers is expensive
+- Sparse access patterns where only a few pages are actually needed
+- Workloads with repeated access to the same pages (caching benefit)
+
+The framework is in place; what remains is integrating it as an alternative
+to the inline sync path for CUDA operations.
