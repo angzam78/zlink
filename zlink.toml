@@ -1,0 +1,42 @@
+# zlink shim configuration
+# Place this file as zlink.toml in the working directory or
+# point to it with ZLINK_CONFIG=/path/to/zlink.toml
+
+[server]
+host = "gpu-server"
+port = 14833
+
+[target]
+# Name or path of the shared library to remote
+library = "libcuda.so.1"
+
+# Optional: path to the real library (for passthrough symbols)
+# real_path = "/usr/lib/x86_64-linux-gnu/libcuda.so.1"
+
+[shim]
+# Symbols to intercept (empty = intercept all exported symbols)
+# intercept = ["cuInit", "cuMemAlloc", "cuMemcpyHtoD", "cuLaunchKernel"]
+
+# Symbols to pass through to the real library
+# passthrough = ["cuGetErrorString", "cuDriverGetVersion"]
+
+[memory]
+# Enable demand paging for transparent remote memory access
+demand_paging = true
+
+# Size of the shadow memory region (client-side)
+shadow_size = "4GiB"
+
+# Page size for demand paging
+page_size = 4096
+
+[transport]
+# Transport type: "tcp", "unix", "http2"
+type = "tcp"
+
+# TCP_NODELAY for low latency
+nodelay = true
+
+# Send/receive buffer sizes
+send_buffer = "1MiB"
+recv_buffer = "1MiB"

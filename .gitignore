@@ -1,0 +1,38 @@
+# Build directories
+build/
+out/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Compiled objects
+*.o
+*.a
+*.so
+*.dylib
+
+# Executables
+zlink_server
+math_client
+math_server
+cuda_test_client
+cuda_test_server
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Dependencies (fetched by CMake)
+_deps/
+
+# CMake generated
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+CTestTestfile.cmake
