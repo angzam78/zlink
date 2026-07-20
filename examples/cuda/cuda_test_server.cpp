@@ -18,6 +18,7 @@
 #include <zlink/chunk_cache.hpp>
 #include <zlink/config.hpp>
 #include <zlink/virtual_handle.hpp>
+#include <zlink/compress.hpp>
 
 #include <zpp_bits.h>
 
@@ -546,15 +547,23 @@ static bool handle_pipeline(zlink::transport& tp, const zlink::frame& req_frame)
     return !ec;
 }
 
-// ── Handle a pipeline_mem frame (v2: with handle manifest) ───────────
+// ── Handle a pipeline_mem frame (v2: with handle manifest + LZ4 compression) ──
 // Wire format (request):
 //   [4B sync_count]
-//   for each sync: [8B addr][8B size][data...]
+//   for each sync: [8B addr][8B original_size][1B comp_flag][4B data_size][data...]
+//     comp_flag: 0=raw, 1=LZ4 compressed
+//     data_size: wire bytes (compressed or raw)
 //   [4B rpc_count]
 //   for each rpc: [4B len][rpc_bytes]
 //   [4B read_count]
 //   for each read: [8B addr][8B size]
 //   [handle_manifest: 4B count + N × handle_manifest_entry]
+//
+// Wire format (response):
+//   [4B rpc_count] [4B len1][resp1]...
+//   [4B read_count]
+//   for each read: [4B data_len][1B comp_flag][data...]
+//     When comp_flag=LZ4: data = [8B original_size][compressed_bytes]
 //
 // Handle registration works via the handle_producer_guard mechanism:
 // Each handle-producing wrapper function sets g_last_produced_handle.
@@ -580,21 +589,73 @@ static bool handle_pipeline_mem(zlink::transport& tp, const zlink::frame& req_fr
     std::cerr << "  [server] pipeline_mem: " << sync_count << " syncs";
 
     for (std::uint32_t i = 0; i < sync_count; i++) {
-        if (off + 16 > req_frame.payload.size()) break;
+        if (off + 17 > req_frame.payload.size()) break;  // 8 addr + 8 orig_size + 1 comp_flag
 
-        std::uint64_t addr = 0, sz = 0;
+        std::uint64_t addr = 0, orig_sz = 0;
+        std::uint8_t comp_flag = 0;
         std::memcpy(&addr, req_frame.payload.data() + off, 8); off += 8;
-        std::memcpy(&sz, req_frame.payload.data() + off, 8); off += 8;
+        std::memcpy(&orig_sz, req_frame.payload.data() + off, 8); off += 8;
+        std::memcpy(&comp_flag, req_frame.payload.data() + off, 1); off += 1;
 
-        if (off + sz > req_frame.payload.size()) break;
+        // Determine data size: if compressed, we need to read compressed bytes
+        // until the next entry. For raw data, data size = orig_sz.
+        // With the new format, the data follows directly after comp_flag.
+        // The remaining data for this sync entry is orig_sz bytes for raw,
+        // or a variable amount for compressed data.
+        // We read orig_sz bytes for raw; for compressed, we don't know the
+        // compressed size from the header alone. But since entries are
+        // sequential, we need a different approach: the wire format includes
+        // the original_size so the decompressor knows the expected output,
+        // but we need to know how many compressed bytes to read.
+        //
+        // Solution: for compressed entries, we read the remaining payload
+        // up to what makes sense. The client writes the compressed data
+        // contiguously, so we need to know the compressed size.
+        // We DON'T have it in the header. Two options:
+        //   1. Add a 4B compressed_size field before the data
+        //   2. Use orig_sz for raw, and for compressed, store [4B comp_size][data]
+        //
+        // Actually, looking at the client code: it writes comp_flag then data
+        // contiguously. We need a compressed_size field. Let me re-check...
+        //
+        // The current client writes: [8B addr][8B orig_sz][1B comp_flag][data...]
+        // For raw: data is orig_sz bytes.
+        // For LZ4: data is compressed_size bytes (unknown to reader!).
+        //
+        // Fix: add [4B data_size] after comp_flag so the reader knows
+        // exactly how many bytes to consume.
+        //
+        // Updated format: [8B addr][8B orig_sz][1B comp_flag][4B data_size][data...]
+        // This is a BREAKING CHANGE to the wire format.
 
-        std::span<const std::byte> sync_data(
-            req_frame.payload.data() + off, static_cast<std::size_t>(sz));
-        off += sz;
+        std::uint32_t data_size = 0;
+        if (off + 4 > req_frame.payload.size()) break;
+        std::memcpy(&data_size, req_frame.payload.data() + off, 4); off += 4;
 
-        g_host_mirror.sync_page(static_cast<std::uintptr_t>(addr), sync_data);
+        if (off + data_size > req_frame.payload.size()) break;
+
+        // Decompress if needed
+        std::vector<std::byte> sync_data;
+        if (comp_flag == zlink::comp_flag_lz4) {
+            sync_data = zlink::decompress(
+                std::span<const std::byte>(req_frame.payload.data() + off, data_size),
+                comp_flag, static_cast<std::size_t>(orig_sz));
+            if (sync_data.empty()) {
+                std::cerr << "  [server] WARNING: LZ4 decompression failed for sync entry " << i << "\n";
+            }
+        } else {
+            sync_data.assign(
+                req_frame.payload.data() + off,
+                req_frame.payload.data() + off + data_size);
+        }
+        off += data_size;
+
+        g_host_mirror.sync_page(static_cast<std::uintptr_t>(addr),
+                                std::span<const std::byte>(sync_data.data(), sync_data.size()));
         std::cerr << ", sync(addr=0x" << std::hex << addr
-                  << ",size=" << std::dec << sz << ")";
+                  << ",orig=" << std::dec << orig_sz
+                  << ",comp=" << (comp_flag ? "LZ4" : "raw")
+                  << ",wire=" << data_size << ")";
     }
     std::cerr << "\n";
 
@@ -682,14 +743,48 @@ static bool handle_pipeline_mem(zlink::transport& tp, const zlink::frame& req_fr
             bytes_read = static_cast<std::size_t>(sz);
         }
 
-        std::uint32_t data_len = static_cast<std::uint32_t>(bytes_read);
-        std::size_t prev_size = read_responses.size();
-        read_responses.resize(prev_size + 4 + bytes_read);
-        std::memcpy(read_responses.data() + prev_size, &data_len, 4);
-        if (bytes_read > 0) {
-            std::memcpy(read_responses.data() + prev_size + 4, mirror_data.data(), bytes_read);
+        // Compress read data with LZ4 (large reads benefit significantly)
+        auto compressed = zlink::compress(
+            std::span<const std::byte>(mirror_data.data(), bytes_read));
+
+        // Response format: [4B data_len][1B comp_flag][data...]
+        // When LZ4: data = [8B original_size][compressed_bytes]
+        // When raw: data = raw_bytes
+        std::size_t data_field_size = 0;
+        if (compressed.comp_flag == zlink::comp_flag_lz4) {
+            // [8B original_size][compressed_bytes]
+            data_field_size = 8 + compressed.data.size();
+        } else {
+            // raw bytes
+            data_field_size = compressed.data.size();
         }
+
+        std::uint32_t total_len = static_cast<std::uint32_t>(1 + data_field_size); // 1 for comp_flag
+        std::size_t prev_size = read_responses.size();
+        read_responses.resize(prev_size + 4 + total_len);
+        std::memcpy(read_responses.data() + prev_size, &total_len, 4);
+        std::size_t write_off = prev_size + 4;
+
+        // Write comp_flag
+        std::uint8_t cflag = compressed.comp_flag;
+        std::memcpy(read_responses.data() + write_off, &cflag, 1); write_off += 1;
+
+        if (compressed.comp_flag == zlink::comp_flag_lz4) {
+            // Write original_size then compressed data
+            std::uint64_t orig_sz = compressed.original_size;
+            std::memcpy(read_responses.data() + write_off, &orig_sz, 8); write_off += 8;
+            std::memcpy(read_responses.data() + write_off, compressed.data.data(),
+                        compressed.data.size());
+        } else {
+            // Write raw data
+            std::memcpy(read_responses.data() + write_off, compressed.data.data(),
+                        compressed.data.size());
+        }
+
         read_resp_count++;
+        std::cerr << "  [server]   read " << i << ": " << bytes_read << " bytes, "
+                  << (compressed.comp_flag == zlink::comp_flag_lz4 ? "LZ4" : "raw")
+                  << " (" << compressed.data.size() << " on wire)\n";
     }
 
     std::memcpy(read_responses.data(), &read_resp_count, 4);

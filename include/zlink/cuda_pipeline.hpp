@@ -49,23 +49,22 @@
 //
 //   Wire format (pipeline_mem request):
 //     [4B sync_count]
-//     [4B sync1_addr][8B sync1_size][sync1_data...]
-//     ...
+//     for each sync: [8B addr][8B original_size][1B comp_flag][4B data_size][data...]
+//       comp_flag: 0=raw (data=original bytes), 1=LZ4 (data=compressed)
+//       data_size: number of bytes in data field (wire bytes, not original)
 //     [4B rpc_count]
-//     [4B rpc1_len][rpc1_bytes]
-//     ...
+//     for each rpc: [4B rpc_len][rpc_bytes]
 //     [4B read_count]
-//     [4B read1_addr][8B read1_size]
-//     ...
+//     for each read: [8B addr][8B size]
+//     [handle_manifest]
 //
 //   Wire format (pipeline_mem response):
-//     [4B sync_ack_count]  // acks for each sync
 //     [4B rpc_count]
-//     [4B rpc1_len][rpc1_bytes]
-//     ...
+//     for each rpc: [4B resp_len][resp_bytes]
 //     [4B read_count]
-//     [4B read1_len][read1_data...]
-//     ...
+//     for each read: [4B data_len][1B comp_flag][data...]
+//       comp_flag: 0=raw, 1=LZ4
+//       When LZ4: data = [8B original_size][compressed_bytes]
 //
 //   This eliminates 2 extra round-trips per cuMemcpyHtoD and cuMemcpyDtoH!
 
@@ -73,6 +72,7 @@
 #include <zlink/transport.hpp>
 #include <zlink/memory.hpp>
 #include <zlink/virtual_handle.hpp>
+#include <zlink/compress.hpp>
 
 #include <zpp_bits.h>
 
@@ -507,30 +507,45 @@ private:
 
     // ── Flush using pipeline_mem frame (syncs + RPCs, no reads) ──
     // Combines host_sync data + RPC calls into ONE network round-trip.
+    // Sync data is LZ4-compressed if >= 4 KB and compressible.
     std::vector<pipe_result> flush_pipeline_mem() {
         // Build pipeline_mem payload:
         //   [4B sync_count]
-        //   for each sync: [4B:padding][8B addr][8B size][data...]
+        //   for each sync: [8B addr][8B original_size][1B comp_flag][data...]
         //   [4B rpc_count]
         //   for each rpc: [4B len][rpc_bytes]
 
         std::vector<std::byte> payload;
 
-        // ── Sync entries ──
+        // ── Sync entries (with optional LZ4 compression) ──
+        // Compress first, then build payload with known sizes
+        std::vector<compress_result> compressed_syncs;
+        compressed_syncs.reserve(syncs_.size());
+        for (auto& s : syncs_) {
+            compressed_syncs.push_back(
+                zlink::compress(std::span<const std::byte>(s.data.data(), s.data.size())));
+        }
+
         std::uint32_t sync_count = static_cast<std::uint32_t>(syncs_.size());
         std::size_t sync_section_size = 4;
-        for (auto& s : syncs_) {
-            sync_section_size += 8 + 8 + s.data.size(); // addr + size + data
+        for (auto& cs : compressed_syncs) {
+            sync_section_size += 8 + 8 + 1 + 4 + cs.data.size(); // addr + orig_size + comp_flag + data_size + data
         }
         payload.resize(sync_section_size);
         std::memcpy(payload.data(), &sync_count, 4);
         std::size_t off = 4;
-        for (auto& s : syncs_) {
+        for (std::size_t i = 0; i < syncs_.size(); i++) {
+            auto& s = syncs_[i];
+            auto& cs = compressed_syncs[i];
             std::uint64_t addr = s.client_addr;
-            std::uint64_t sz = s.data.size();
+            std::uint64_t orig_sz = cs.original_size;
+            std::uint8_t cflag = cs.comp_flag;
+            std::uint32_t data_sz = static_cast<std::uint32_t>(cs.data.size());
             std::memcpy(payload.data() + off, &addr, 8); off += 8;
-            std::memcpy(payload.data() + off, &sz, 8); off += 8;
-            std::memcpy(payload.data() + off, s.data.data(), s.data.size()); off += s.data.size();
+            std::memcpy(payload.data() + off, &orig_sz, 8); off += 8;
+            std::memcpy(payload.data() + off, &cflag, 1); off += 1;
+            std::memcpy(payload.data() + off, &data_sz, 4); off += 4;
+            std::memcpy(payload.data() + off, cs.data.data(), cs.data.size()); off += cs.data.size();
         }
 
         // ── RPC entries ──
@@ -582,26 +597,39 @@ private:
 
     // ── Flush using pipeline_mem frame with reads ────────────────
     // Combines: syncs + RPCs + read requests → one round-trip
-    // Server processes: apply syncs, run RPCs, then read mirror data
-    // and pack it into the response.
+    // Server processes: apply syncs (with decompression), run RPCs, then
+    // read mirror data (compress it) and pack into the response.
     std::vector<pipe_result> flush_pipeline_mem_with_reads() {
         std::vector<std::byte> payload;
 
-        // ── Sync entries ──
+        // ── Sync entries (with optional LZ4 compression) ──
+        std::vector<compress_result> compressed_syncs;
+        compressed_syncs.reserve(syncs_.size());
+        for (auto& s : syncs_) {
+            compressed_syncs.push_back(
+                zlink::compress(std::span<const std::byte>(s.data.data(), s.data.size())));
+        }
+
         std::uint32_t sync_count = static_cast<std::uint32_t>(syncs_.size());
         std::size_t sync_section_size = 4;
-        for (auto& s : syncs_) {
-            sync_section_size += 8 + 8 + s.data.size();
+        for (auto& cs : compressed_syncs) {
+            sync_section_size += 8 + 8 + 1 + 4 + cs.data.size(); // addr + orig_size + comp_flag + data_size + data
         }
         payload.resize(sync_section_size);
         std::memcpy(payload.data(), &sync_count, 4);
         std::size_t off = 4;
-        for (auto& s : syncs_) {
+        for (std::size_t i = 0; i < syncs_.size(); i++) {
+            auto& s = syncs_[i];
+            auto& cs = compressed_syncs[i];
             std::uint64_t addr = s.client_addr;
-            std::uint64_t sz = s.data.size();
+            std::uint64_t orig_sz = cs.original_size;
+            std::uint8_t cflag = cs.comp_flag;
+            std::uint32_t data_sz = static_cast<std::uint32_t>(cs.data.size());
             std::memcpy(payload.data() + off, &addr, 8); off += 8;
-            std::memcpy(payload.data() + off, &sz, 8); off += 8;
-            std::memcpy(payload.data() + off, s.data.data(), s.data.size()); off += s.data.size();
+            std::memcpy(payload.data() + off, &orig_sz, 8); off += 8;
+            std::memcpy(payload.data() + off, &cflag, 1); off += 1;
+            std::memcpy(payload.data() + off, &data_sz, 4); off += 4;
+            std::memcpy(payload.data() + off, cs.data.data(), cs.data.size()); off += cs.data.size();
         }
 
         // ── RPC entries ──
@@ -699,7 +727,8 @@ private:
 
     // ── Parse pipeline_mem response ──────────────────────────────
     // Format: [4B rpc_count][4B len1][resp1]...[4B read_count]
-    //         [4B read1_len][read1_data]...
+    //         for each read: [4B data_len][1B comp_flag][data...]
+    //         When comp_flag=LZ4: data = [8B original_size][compressed_bytes]
     // Also writes read data to the host buffers registered in reads_.
     std::vector<pipe_result> parse_pipeline_mem_response(
         std::span<const std::byte> payload)
@@ -725,7 +754,7 @@ private:
             off += len;
         }
 
-        // ── Read data ──
+        // ── Read data (with optional LZ4 decompression) ──
         if (off + 4 <= payload.size()) {
             std::uint32_t read_count = 0;
             std::memcpy(&read_count, payload.data() + off, 4); off += 4;
@@ -733,17 +762,44 @@ private:
             for (std::uint32_t i = 0; i < read_count && i < reads_.size(); i++) {
                 if (off + 4 > payload.size()) break;
 
-                std::uint32_t read_len = 0;
-                std::memcpy(&read_len, payload.data() + off, 4); off += 4;
+                std::uint32_t data_len = 0;
+                std::memcpy(&data_len, payload.data() + off, 4); off += 4;
 
-                if (off + read_len > payload.size()) break;
+                if (off + data_len > payload.size()) break;
 
-                // Copy read data to the client's host buffer
+                // Read comp_flag
+                std::uint8_t comp_flag = zlink::comp_flag_raw;
+                if (data_len >= 1) {
+                    std::memcpy(&comp_flag, payload.data() + off, 1);
+                    off += 1;
+                    data_len -= 1;
+                }
+
                 auto& rd = reads_[i];
                 void* host_ptr = reinterpret_cast<void*>(rd.client_addr);
-                std::size_t copy_size = std::min(static_cast<std::size_t>(read_len), rd.size);
-                std::memcpy(host_ptr, payload.data() + off, copy_size);
-                off += read_len;
+                std::size_t copy_size = rd.size; // Expected size
+
+                if (comp_flag == zlink::comp_flag_lz4 && data_len >= 8) {
+                    // LZ4 compressed: [8B original_size][compressed_bytes]
+                    std::uint64_t original_size = 0;
+                    std::memcpy(&original_size, payload.data() + off, 8);
+                    off += 8;
+                    data_len -= 8;
+
+                    // Decompress
+                    auto decompressed = zlink::decompress(
+                        std::span<const std::byte>(payload.data() + off, data_len),
+                        comp_flag, static_cast<std::size_t>(original_size));
+
+                    std::size_t copy_len = std::min(decompressed.size(), copy_size);
+                    std::memcpy(host_ptr, decompressed.data(), copy_len);
+                    off += data_len;
+                } else {
+                    // Raw data
+                    std::size_t copy_len = std::min(static_cast<std::size_t>(data_len), copy_size);
+                    std::memcpy(host_ptr, payload.data() + off, copy_len);
+                    off += data_len;
+                }
             }
         }
 

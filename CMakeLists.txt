@@ -9,6 +9,10 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # ── Dependencies ────────────────────────────────────────────────────────
 include(cmake/FetchZppBits.cmake)
 
+# ── LZ4 compression ────────────────────────────────────────────────────
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LZ4 REQUIRED IMPORTED_TARGET liblz4)
+
 # ── Core library (mostly header-only) ──────────────────────────────────
 add_library(zlink_core STATIC
     src/tcp_transport.cpp
@@ -25,6 +29,7 @@ target_include_directories(zlink_core PUBLIC
 )
 target_link_libraries(zlink_core PUBLIC
     zpp_bits
+    PkgConfig::LZ4
     Threads::Threads
 )
 target_compile_options(zlink_core PRIVATE
