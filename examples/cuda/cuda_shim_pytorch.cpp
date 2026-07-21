@@ -310,7 +310,7 @@ static auto cuda_rpc_call_pytorch(Args&&... args) {
     client.template request<FuncIndex>(std::forward<Args>(args)...).or_throw();
 
     zlink::frame req_frame;
-    req_frame.call_id = 1;
+    req_frame.call_id = 2;  // 2 = pytorch RPC (to distinguish from base RPC on server)
     req_frame.type = zlink::frame_type::request;
     req_frame.payload.assign(data.begin(), data.end());
 

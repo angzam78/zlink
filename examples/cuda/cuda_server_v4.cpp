@@ -1111,19 +1111,24 @@ int main(int argc, char* argv[]) {
                     continue;
                 }
 
-                // Single RPC call — try both full and pytorch RPC types
+                // Single RPC call — dispatch based on call_id
                 auto [data, in, out] = zpp::bits::data_in_out();
                 data.assign(req_frame.payload.begin(), req_frame.payload.end());
 
-                // Try the full 48-function RPC first
-                cuda_v2_rpc_full::server server{in, out};
-                auto result = server.serve();
-                if (zpp::bits::failure(result)) {
-                    // Fall back to pytorch 10-function RPC
+                // call_id == 2 means pytorch RPC (10-function client-side type)
+                // call_id == 1 (or any other) means base/full RPC (48-function type)
+                if (req_frame.call_id == 2) {
                     pytorch_rpc::rpc::server pytorch_server{in, out};
-                    result = pytorch_server.serve();
+                    auto result = pytorch_server.serve();
                     if (zpp::bits::failure(result)) {
-                        std::cerr << "Serve error (both RPC types failed)\n";
+                        std::cerr << "Serve error (pytorch RPC failed)\n";
+                        break;
+                    }
+                } else {
+                    cuda_v2_rpc_full::server server{in, out};
+                    auto result = server.serve();
+                    if (zpp::bits::failure(result)) {
+                        std::cerr << "Serve error (full RPC failed)\n";
                         break;
                     }
                 }
