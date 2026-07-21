@@ -958,9 +958,15 @@ CUresult cuGetProcAddress(const char* symbol, void** pfn,
         return CUDA_SUCCESS;
     }
 
-    // Not a locally-known driver function — forward to server for resolution.
-    // This handles GPU kernel entry points and other symbols loaded from
-    // CUDA modules at runtime.
+    // Not a locally-known driver function — check if this is a driver API
+    // function (starts with "cu") that the server knows about. For these,
+    // we return the universal stub since PyTorch may call them directly
+    // through the function pointer. The actual RPC happens when PyTorch
+    // calls the same function through libcuda.so (our shim).
+    //
+    // For non-driver symbols (e.g., GPU kernel entry points from
+    // cuModuleGetFunction), we DO need virtual handles because those
+    // are used with cuLaunchKernel.
     init_shim();
     if (!g_initialized) return CUDA_ERROR_NOT_INITIALIZED;
 
@@ -968,10 +974,26 @@ CUresult cuGetProcAddress(const char* symbol, void** pfn,
         std::string(symbol), static_cast<int32_t>(cudaVersion),
         static_cast<std::uint64_t>(flags));
     if (ret.result == static_cast<int32_t>(CUDA_SUCCESS) && ret.func_ptr != 0) {
-        static std::uint64_t next_func_id = 0x7f0800000000ULL;
-        std::uint64_t client_handle = next_func_id++;
-        register_handle(client_handle, ret.func_ptr, "func");
-        *pfn = reinterpret_cast<void*>(client_handle);
+        // Check if this is a driver API function (starts with "cu" but not
+        // a kernel entry point). Driver API functions start with "cu" and
+        // the third character is uppercase (e.g., "cuInit", "cuMemAlloc").
+        // Kernel entry points have mangled names or lowercase third chars.
+        bool is_driver_api = (symbol[0] == 'c' && symbol[1] == 'u' &&
+                              symbol[2] >= 'A' && symbol[2] <= 'Z');
+
+        if (is_driver_api) {
+            // Driver API function: return the stub (PyTorch may call via fp).
+            // The actual work happens when PyTorch calls through libcuda.so.
+            static CUresult (*stub_fn)() = []() -> CUresult { return CUDA_SUCCESS; };
+            *pfn = reinterpret_cast<void*>(stub_fn);
+        } else {
+            // Kernel entry point or other symbol: use virtual handle.
+            // These are used with cuLaunchKernel, never called directly.
+            static std::uint64_t next_func_id = 0x7f0800000000ULL;
+            std::uint64_t client_handle = next_func_id++;
+            register_handle(client_handle, ret.func_ptr, "func");
+            *pfn = reinterpret_cast<void*>(client_handle);
+        }
 
         if (symbolStatus) {
             *static_cast<int*>(symbolStatus) = 0; // CU_GET_PROC_ADDRESS_SUCCESS
