@@ -903,9 +903,16 @@ static std::unordered_map<std::string, void*>& get_local_symbol_map() {
     static std::unordered_map<std::string, void*> symbols;
     static bool initialized = false;
     if (!initialized) {
-        // Use dlsym to find our own exported symbols — this avoids
-        // forward-reference issues and works for all extern "C" functions
-        void* self = dlopen(NULL, RTLD_NOW | RTLD_GLOBAL);
+        // Open our own shared library (libcuda.so.1) to find exported symbols.
+        // We cannot use dlopen(NULL, ...) because that returns the main
+        // executable handle, which does not include symbols from shared
+        // libraries loaded via LD_LIBRARY_PATH even with RTLD_GLOBAL.
+        // Using RTLD_NOLOAD avoids re-initializing the library.
+        void* self = dlopen("libcuda.so.1", RTLD_NOW | RTLD_NOLOAD);
+        if (!self) {
+            // Fallback: try dlopen(NULL) in case the library was linked
+            self = dlopen(NULL, RTLD_NOW | RTLD_GLOBAL);
+        }
         if (self) {
             // Core functions that libcudart resolves via cuGetProcAddress
             for (const char* name : {
