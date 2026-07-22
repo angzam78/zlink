@@ -530,10 +530,21 @@ class CudaCodegen:
             lines.append(f"        uint64_t client_handle = allocate_client_handle(\"{handle_type}\");")
             lines.append(f"        register_handle(client_handle, ret.{hp}, \"{handle_type}\");")
 
-            # Find the output param that corresponds to this handle
+            # Find the SPECIFIC output param that corresponds to this handle_produce
+            # Only match params whose name matches the hp field name
+            matched = False
             for p in params:
-                if p.get("direction") == "out" and is_handle_type(p["type"].rstrip("*")):
+                if p.get("direction") == "out" and p["name"] == hp and is_handle_type(p["type"].rstrip("*")):
                     lines.append(f"        *{p['name']} = reinterpret_cast<{p['type'].rstrip('*')}>(client_handle);")
+                    matched = True
+            # If no direct name match, fall back to first output handle param
+            # (safe for functions with single handle_produce, which covers all current CUDA APIs)
+            if not matched:
+                for p in params:
+                    if p.get("direction") == "out" and is_handle_type(p["type"].rstrip("*")):
+                        lines.append(f"        *{p['name']} = reinterpret_cast<{p['type'].rstrip('*')}>(client_handle);")
+                        matched = True
+                        break
 
             lines.append("    }")
 
@@ -588,7 +599,31 @@ class CudaCodegen:
                 if size_param:
                     lines.append(f"    if (ret.result == CUDA_SUCCESS) readback_from_server({pname}, {size_param});")
 
-        # 10. Return result
+        # 10. Unregister consumed handles/devptrs on success
+        # Destroy/free functions must clean up local maps after a successful call
+        for hc in func.get("handle_consumes", []):
+            # Find the param that matches this consumed handle
+            for p in params:
+                if p["name"] == hc and p.get("direction", "in") in ("in", "inout"):
+                    if is_input_handle(p):
+                        lines.append(f"    if (ret.result == CUDA_SUCCESS) unregister_handle(reinterpret_cast<uint64_t>({hc}));")
+                    elif is_devptr(p):
+                        lines.append(f"    if (ret.result == CUDA_SUCCESS) unregister_devptr(static_cast<CUdeviceptr>({hc}));")
+
+        # Also auto-unregister for destroy/free functions even without annotations
+        # Detect: function name contains Free/Destroy/Unload and has handle/devptr input
+        func_name_lower = name.lower()
+        is_destroy_or_free = any(kw in func_name_lower for kw in ['free', 'destroy', 'unload'])
+        if is_destroy_or_free:
+            for p in params:
+                pname = p["name"]
+                if p.get("direction", "in") in ("in", "inout"):
+                    if is_devptr(p) and pname not in func.get("handle_consumes", []):
+                        lines.append(f"    if (ret.result == CUDA_SUCCESS) unregister_devptr(static_cast<CUdeviceptr>({pname}));")
+                    elif is_input_handle(p) and pname not in func.get("handle_consumes", []):
+                        lines.append(f"    if (ret.result == CUDA_SUCCESS) unregister_handle(reinterpret_cast<uint64_t>({pname}));")
+
+        # 11. Return result
         lines.append("    return static_cast<CUresult>(ret.result);")
         lines.append("}")
         return '\n'.join(lines)

@@ -237,6 +237,7 @@ CUresult cuCtxDestroy(CUcontext ctx) {
     auto server_ctx = translate_handle(reinterpret_cast<uint64_t>(ctx));
     if (!server_ctx) return CUDA_ERROR_INVALID_HANDLE;
     auto ret = cuda_rpc_call<func_index::ctx_destroy>(*server_ctx);
+    if (ret.result == CUDA_SUCCESS) unregister_handle(reinterpret_cast<uint64_t>(ctx));
     return static_cast<CUresult>(ret.result);
 }
 
@@ -247,6 +248,7 @@ CUresult cuCtxDestroy_v2(CUcontext ctx) {
     auto server_ctx = translate_handle(reinterpret_cast<uint64_t>(ctx));
     if (!server_ctx) return CUDA_ERROR_INVALID_HANDLE;
     auto ret = cuda_rpc_call<func_index::ctx_destroy_v2>(*server_ctx);
+    if (ret.result == CUDA_SUCCESS) unregister_handle(reinterpret_cast<uint64_t>(ctx));
     return static_cast<CUresult>(ret.result);
 }
 
@@ -508,6 +510,7 @@ CUresult cuMemFree(CUdeviceptr dptr) {
     auto remote_dptr = g_ptr_map.to_remote(dptr);
     if (!remote_dptr) return CUDA_ERROR_INVALID_DEVICE_POINTER;
     auto ret = cuda_rpc_call<func_index::mem_free>(*remote_dptr);
+    if (ret.result == CUDA_SUCCESS) unregister_devptr(static_cast<CUdeviceptr>(dptr));
     return static_cast<CUresult>(ret.result);
 }
 
@@ -518,6 +521,7 @@ CUresult cuMemFree_v2(CUdeviceptr dptr) {
     auto remote_dptr = g_ptr_map.to_remote(dptr);
     if (!remote_dptr) return CUDA_ERROR_INVALID_DEVICE_POINTER;
     auto ret = cuda_rpc_call<func_index::mem_free_v2>(*remote_dptr);
+    if (ret.result == CUDA_SUCCESS) unregister_devptr(static_cast<CUdeviceptr>(dptr));
     return static_cast<CUresult>(ret.result);
 }
 
@@ -1103,6 +1107,7 @@ CUresult cuMemAddressFree(CUdeviceptr ptr, size_t size) {
     auto remote_ptr = g_ptr_map.to_remote(ptr);
     if (!remote_ptr) return CUDA_ERROR_INVALID_DEVICE_POINTER;
     auto ret = cuda_rpc_call<func_index::mem_address_free>(*remote_ptr, static_cast<uint64_t>(size));
+    if (ret.result == CUDA_SUCCESS) unregister_devptr(static_cast<CUdeviceptr>(ptr));
     return static_cast<CUresult>(ret.result);
 }
 
@@ -1253,6 +1258,7 @@ CUresult cuModuleUnload(CUmodule hmod) {
     auto server_hmod = translate_handle(reinterpret_cast<uint64_t>(hmod));
     if (!server_hmod) return CUDA_ERROR_INVALID_HANDLE;
     auto ret = cuda_rpc_call<func_index::module_unload>(*server_hmod);
+    if (ret.result == CUDA_SUCCESS) unregister_handle(reinterpret_cast<uint64_t>(hmod));
     return static_cast<CUresult>(ret.result);
 }
 
@@ -1414,6 +1420,7 @@ CUresult cuStreamDestroy(CUstream hStream) {
     auto server_hStream = translate_handle(reinterpret_cast<uint64_t>(hStream));
     if (!server_hStream) return CUDA_ERROR_INVALID_HANDLE;
     auto ret = cuda_rpc_call<func_index::stream_destroy>(*server_hStream);
+    if (ret.result == CUDA_SUCCESS) unregister_handle(reinterpret_cast<uint64_t>(hStream));
     return static_cast<CUresult>(ret.result);
 }
 
@@ -1424,6 +1431,7 @@ CUresult cuStreamDestroy_v2(CUstream hStream) {
     auto server_hStream = translate_handle(reinterpret_cast<uint64_t>(hStream));
     if (!server_hStream) return CUDA_ERROR_INVALID_HANDLE;
     auto ret = cuda_rpc_call<func_index::stream_destroy_v2>(*server_hStream);
+    if (ret.result == CUDA_SUCCESS) unregister_handle(reinterpret_cast<uint64_t>(hStream));
     return static_cast<CUresult>(ret.result);
 }
 
@@ -1681,6 +1689,7 @@ CUresult cuEventDestroy(CUevent hEvent) {
     auto server_hEvent = translate_handle(reinterpret_cast<uint64_t>(hEvent));
     if (!server_hEvent) return CUDA_ERROR_INVALID_HANDLE;
     auto ret = cuda_rpc_call<func_index::event_destroy>(*server_hEvent);
+    if (ret.result == CUDA_SUCCESS) unregister_handle(reinterpret_cast<uint64_t>(hEvent));
     return static_cast<CUresult>(ret.result);
 }
 
@@ -1691,6 +1700,7 @@ CUresult cuEventDestroy_v2(CUevent hEvent) {
     auto server_hEvent = translate_handle(reinterpret_cast<uint64_t>(hEvent));
     if (!server_hEvent) return CUDA_ERROR_INVALID_HANDLE;
     auto ret = cuda_rpc_call<func_index::event_destroy_v2>(*server_hEvent);
+    if (ret.result == CUDA_SUCCESS) unregister_handle(reinterpret_cast<uint64_t>(hEvent));
     return static_cast<CUresult>(ret.result);
 }
 
@@ -2071,6 +2081,7 @@ CUresult cuArrayDestroy(CUarray hArray) {
     auto server_hArray = translate_handle(reinterpret_cast<uint64_t>(hArray));
     if (!server_hArray) return CUDA_ERROR_INVALID_HANDLE;
     auto ret = cuda_rpc_call<func_index::array_destroy>(*server_hArray);
+    if (ret.result == CUDA_SUCCESS) unregister_handle(reinterpret_cast<uint64_t>(hArray));
     return static_cast<CUresult>(ret.result);
 }
 
@@ -2096,6 +2107,7 @@ CUresult cuMipmappedArrayDestroy(CUmipmappedArray hMipmappedArray) {
     auto server_hMipmappedArray = translate_handle(reinterpret_cast<uint64_t>(hMipmappedArray));
     if (!server_hMipmappedArray) return CUDA_ERROR_INVALID_HANDLE;
     auto ret = cuda_rpc_call<func_index::mipmapped_array_destroy>(*server_hMipmappedArray);
+    if (ret.result == CUDA_SUCCESS) unregister_handle(reinterpret_cast<uint64_t>(hMipmappedArray));
     return static_cast<CUresult>(ret.result);
 }
 
@@ -2168,6 +2180,7 @@ CUresult cuGraphDestroy(CUgraph hGraph) {
     auto server_hGraph = translate_handle(reinterpret_cast<uint64_t>(hGraph));
     if (!server_hGraph) return CUDA_ERROR_INVALID_HANDLE;
     auto ret = cuda_rpc_call<func_index::graph_destroy>(*server_hGraph);
+    if (ret.result == CUDA_SUCCESS) unregister_handle(reinterpret_cast<uint64_t>(hGraph));
     return static_cast<CUresult>(ret.result);
 }
 
@@ -2276,6 +2289,7 @@ CUresult cuGraphDestroyNode(CUgraphNode hNode) {
     auto server_hNode = translate_handle(reinterpret_cast<uint64_t>(hNode));
     if (!server_hNode) return CUDA_ERROR_INVALID_HANDLE;
     auto ret = cuda_rpc_call<func_index::graph_destroy_node>(*server_hNode);
+    if (ret.result == CUDA_SUCCESS) unregister_handle(reinterpret_cast<uint64_t>(hNode));
     return static_cast<CUresult>(ret.result);
 }
 
@@ -2325,6 +2339,7 @@ CUresult cuGraphExecDestroy(CUgraphExec hGraphExec) {
     auto server_hGraphExec = translate_handle(reinterpret_cast<uint64_t>(hGraphExec));
     if (!server_hGraphExec) return CUDA_ERROR_INVALID_HANDLE;
     auto ret = cuda_rpc_call<func_index::graph_exec_destroy>(*server_hGraphExec);
+    if (ret.result == CUDA_SUCCESS) unregister_handle(reinterpret_cast<uint64_t>(hGraphExec));
     return static_cast<CUresult>(ret.result);
 }
 
@@ -2728,6 +2743,7 @@ CUresult cuLibraryUnload(CUlibrary library) {
     auto server_library = translate_handle(reinterpret_cast<uint64_t>(library));
     if (!server_library) return CUDA_ERROR_INVALID_HANDLE;
     auto ret = cuda_rpc_call<func_index::library_unload>(*server_library);
+    if (ret.result == CUDA_SUCCESS) unregister_handle(reinterpret_cast<uint64_t>(library));
     return static_cast<CUresult>(ret.result);
 }
 
@@ -3034,6 +3050,7 @@ CUresult cuMemAllocAsync(CUdeviceptr* dptr, size_t bytesize, CUstream hStream) {
         CUdeviceptr client_ptr = g_ptr_map.map(ret.dptr);
         *dptr = client_ptr;
     }
+    if (ret.result == CUDA_SUCCESS) unregister_handle(reinterpret_cast<uint64_t>(hStream));
     return static_cast<CUresult>(ret.result);
 }
 
@@ -3046,6 +3063,8 @@ CUresult cuMemFreeAsync(CUdeviceptr dptr, CUstream hStream) {
     auto server_hStream = translate_handle(reinterpret_cast<uint64_t>(hStream));
     if (!server_hStream) return CUDA_ERROR_INVALID_HANDLE;
     auto ret = cuda_rpc_call<func_index::mem_free_async>(*remote_dptr, *server_hStream);
+    if (ret.result == CUDA_SUCCESS) unregister_handle(reinterpret_cast<uint64_t>(hStream));
+    if (ret.result == CUDA_SUCCESS) unregister_devptr(static_cast<CUdeviceptr>(dptr));
     return static_cast<CUresult>(ret.result);
 }
 
@@ -3099,5 +3118,6 @@ CUresult cuMemPoolDestroy(CUmemGenericAllocationHandle pool) {
     auto server_pool = translate_handle(reinterpret_cast<uint64_t>(pool));
     if (!server_pool) return CUDA_ERROR_INVALID_HANDLE;
     auto ret = cuda_rpc_call<func_index::mem_pool_destroy>(*server_pool);
+    if (ret.result == CUDA_SUCCESS) unregister_handle(reinterpret_cast<uint64_t>(pool));
     return static_cast<CUresult>(ret.result);
 }
