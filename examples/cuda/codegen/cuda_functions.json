@@ -1,6 +1,6 @@
 {
   "version": "12.4+",
-  "description": "CUDA Driver API function database for zlink codegen. Covers all cu* functions from cuda.h, compatible with CUDA 12.4 and above including 13.x. Client and server always use the same zlink build — no protocol versioning needed. Functions not available in the installed CUDA version will return appropriate error codes at runtime. Each function is annotated with RPC marshalling semantics.",
+  "description": "CUDA Driver API function database for zlink codegen. Covers all cu* functions from cuda.h, compatible with CUDA 12.4 and above including 13.x. Client and server always use the same zlink build \u2014 no protocol versioning needed. Functions not available in the installed CUDA version will return appropriate error codes at runtime. Each function is annotated with RPC marshalling semantics.",
   "functions": [
     {
       "name": "cuInit",
@@ -111,6 +111,27 @@
     },
     {
       "name": "cuDeviceGetAttribute",
+      "category": "barrier",
+      "params": [
+        {
+          "name": "value",
+          "type": "int*",
+          "direction": "out"
+        },
+        {
+          "name": "attrib",
+          "type": "unsigned int",
+          "direction": "in"
+        },
+        {
+          "name": "dev",
+          "type": "CUdevice",
+          "direction": "in"
+        }
+      ]
+    },
+    {
+      "name": "cuDeviceGetAttribute_v2",
       "category": "barrier",
       "params": [
         {
@@ -275,6 +296,28 @@
       }
     },
     {
+      "name": "cuDevicePrimaryCtxRetain_v2",
+      "category": "barrier",
+      "params": [
+        {
+          "name": "pctx",
+          "type": "CUcontext*",
+          "direction": "out"
+        },
+        {
+          "name": "dev",
+          "type": "CUdevice",
+          "direction": "in"
+        }
+      ],
+      "handle_produces": [
+        "pctx"
+      ],
+      "handle_type_map": {
+        "pctx": "ctx"
+      }
+    },
+    {
       "name": "cuDevicePrimaryCtxRelease",
       "category": "enqueued",
       "params": [
@@ -330,6 +373,27 @@
     },
     {
       "name": "cuDevicePrimaryCtxGetState",
+      "category": "barrier",
+      "params": [
+        {
+          "name": "flags",
+          "type": "unsigned int*",
+          "direction": "out"
+        },
+        {
+          "name": "active",
+          "type": "int*",
+          "direction": "out"
+        },
+        {
+          "name": "dev",
+          "type": "CUdevice",
+          "direction": "in"
+        }
+      ]
+    },
+    {
+      "name": "cuDevicePrimaryCtxGetState_v2",
       "category": "barrier",
       "params": [
         {
@@ -2852,6 +2916,28 @@
     },
     {
       "name": "cuStreamCreate",
+      "category": "barrier",
+      "params": [
+        {
+          "name": "phStream",
+          "type": "CUstream*",
+          "direction": "out"
+        },
+        {
+          "name": "Flags",
+          "type": "unsigned int",
+          "direction": "in"
+        }
+      ],
+      "handle_produces": [
+        "phStream"
+      ],
+      "handle_type_map": {
+        "phStream": "stream"
+      }
+    },
+    {
+      "name": "cuStreamCreate_v2",
       "category": "barrier",
       "params": [
         {
@@ -6080,7 +6166,7 @@
     {
       "name": "cuMemAllocAsync",
       "category": "barrier",
-      "comment": "Allocate memory from pool asynchronously — critical for PyTorch CUDA allocator",
+      "comment": "Allocate memory from pool asynchronously \u2014 critical for PyTorch CUDA allocator",
       "params": [
         {
           "name": "dptr",
@@ -6108,7 +6194,7 @@
     {
       "name": "cuMemFreeAsync",
       "category": "enqueued",
-      "comment": "Free memory allocated with cuMemAllocAsync — critical for PyTorch CUDA allocator",
+      "comment": "Free memory allocated with cuMemAllocAsync \u2014 critical for PyTorch CUDA allocator",
       "params": [
         {
           "name": "dptr",

@@ -348,6 +348,8 @@ class CudaCodegen:
                 ptype_stripped = param["type"].strip()
                 if ptype_stripped == "const char*" and param.get("direction") == "out":
                     field_type = "std::string"
+                elif ptype_stripped == "char*" and param.get("direction") == "out":
+                    field_type = "std::string"  # String output params carry the string content
                 elif ptype_stripped == "CUdevice*":
                     field_type = "int32_t"
                 elif ptype_stripped == "size_t*":
@@ -558,6 +560,25 @@ class CudaCodegen:
                     lines.append(f"    if (ret.result == CUDA_SUCCESS) *{pname} = ret.{pname};")
                 elif ptype == "unsigned long long*":
                     lines.append(f"    if (ret.result == CUDA_SUCCESS) *{pname} = static_cast<unsigned long long>(ret.{pname});")
+                elif ptype == "char*":
+                    # String output: copy std::string from RPC response into caller's buffer
+                    # Find the size parameter (usually 'len' or similar) for bounds
+                    size_param = None
+                    for p2 in params:
+                        if p2.get("direction", "in") == "in" and p2["name"] in ("len", "length", "size", "bufSize", "nameSize"):
+                            size_param = p2["name"]
+                            break
+                    if size_param:
+                        lines.append(f"    if (ret.result == CUDA_SUCCESS) {{")
+                        lines.append(f"        std::strncpy({pname}, ret.{pname}.c_str(), {size_param} - 1);")
+                        lines.append(f"        {pname}[{size_param} - 1] = '\\0';")
+                        lines.append(f"    }}")
+                    else:
+                        # No known size param — copy with reasonable limit
+                        lines.append(f"    if (ret.result == CUDA_SUCCESS) {{")
+                        lines.append(f"        std::strncpy({pname}, ret.{pname}.c_str(), 255);")
+                        lines.append(f"        {pname}[255] = '\\0';")
+                        lines.append(f"    }}")
 
         # 9. Readback from server
         for p in params:
@@ -654,7 +675,7 @@ class CudaCodegen:
                     lines.append(f"    {ptype} real_{pname} = nullptr;")
                 elif ptype == "CUdeviceptr":
                     lines.append(f"    CUdeviceptr real_{pname} = 0;")
-                elif ptype in ("size_t", "unsigned int", "int", "float", "unsigned long long", "long long"):
+                elif ptype in ("size_t", "unsigned int", "int", "float", "unsigned long long", "long long", "CUdevice"):
                     lines.append(f"    {ptype} real_{pname} = 0;")
                 elif ptype == "char":
                     lines.append(f"    char real_{pname}[256] = {{}};")
@@ -724,6 +745,9 @@ class CudaCodegen:
                     lines.append(f"    ret.{pname} = static_cast<int32_t>(real_{pname});")
                 elif ptype in ("float",):
                     lines.append(f"    ret.{pname} = real_{pname};")
+                elif ptype == "char":
+                    # String output: copy local buffer into std::string for RPC transport
+                    lines.append(f"    ret.{pname} = std::string(real_{pname});")
                 elif ptype in ("unsigned long long",):
                     lines.append(f"    ret.{pname} = static_cast<uint64_t>(real_{pname});")
 

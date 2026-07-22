@@ -243,20 +243,26 @@ static void init_shim() {
 }
 
 // ── RPC helper ─────────────────────────────────────────────────────────
+// Uses separate fresh zpp::bits contexts for request and response (same
+// pattern as zlink::rpc_client::call()). This avoids any stale-archive
+// issues when the data vector contents change between request and response.
+// Over an internet connection, the extra construction cost is negligible
+// compared to the RTT.
 template<int FuncIndex, typename... Args>
 static auto cuda_rpc_call(Args&&... args) {
     std::lock_guard lock(g_rpc_mutex);
 
     using namespace zpp::bits;
-    auto [data, in, out] = data_in_out();
-    cuda_gen::cuda_gen_rpc::client client{in, out};
 
-    client.template request<FuncIndex>(std::forward<Args>(args)...).or_throw();
+    // Serialize request (fresh context)
+    auto [req_data, req_in, req_out] = data_in_out();
+    cuda_gen::cuda_gen_rpc::client req_client{req_in, req_out};
+    req_client.template request<FuncIndex>(std::forward<Args>(args)...).or_throw();
 
     zlink::frame req_frame;
     req_frame.call_id = 1;
     req_frame.type = zlink::frame_type::request;
-    req_frame.payload.assign(data.begin(), data.end());
+    req_frame.payload.assign(req_data.begin(), req_data.end());
 
     auto ec = g_transport->send(req_frame);
     if (ec) throw std::system_error(ec);
@@ -265,10 +271,12 @@ static auto cuda_rpc_call(Args&&... args) {
     ec = g_transport->receive(resp_frame);
     if (ec) throw std::system_error(ec);
 
-    data.clear();
-    data.assign(resp_frame.payload.begin(), resp_frame.payload.end());
+    // Deserialize response (fresh context)
+    auto [resp_data, resp_in, resp_out] = data_in_out();
+    resp_data.assign(resp_frame.payload.begin(), resp_frame.payload.end());
+    cuda_gen::cuda_gen_rpc::client resp_client{resp_in, resp_out};
 
-    return client.template response<FuncIndex>().or_throw();
+    return resp_client.template response<FuncIndex>().or_throw();
 }
 
 // ══════════════════════════════════════════════════════════════════════════
