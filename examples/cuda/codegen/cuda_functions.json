@@ -1,6 +1,6 @@
 {
-  "version": "12.4",
-  "description": "CUDA Driver API function database for zlink codegen. Covers all cu* functions from cuda.h (CUDA 12.4). Each function is annotated with RPC marshalling semantics.",
+  "version": "12.4+",
+  "description": "CUDA Driver API function database for zlink codegen. Covers all cu* functions from cuda.h, compatible with CUDA 12.4 and above including 13.x. Client and server always use the same zlink build — no protocol versioning needed. Functions not available in the installed CUDA version will return appropriate error codes at runtime. Each function is annotated with RPC marshalling semantics.",
   "functions": [
     {
       "name": "cuInit",

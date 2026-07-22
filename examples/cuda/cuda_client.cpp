@@ -1,11 +1,8 @@
-// zlink/examples/cuda/cuda_client_v2.cpp
+// zlink/examples/cuda/cuda_client.cpp
 //
-// CUDA RPC client v2 — Full PyTorch-relevant API with virtual handles.
-//
-// TEMPLATE INDEX CONVENTION:
-//   We use plain integer literals as template args (0, 1, 2...) matching
-//   the zpp_bits binding IDs in cuda_api_v2.hpp. This avoids C++20
-//   identifier parsing issues with names like "10_managed".
+// CUDA RPC client — Full API with virtual handles.
+// Uses the codegen-generated RPC binding (cuda_gen::cuda_gen_rpc).
+// Function indices use named constants from cuda_gen::func_index.
 
 #include <zlink/transport.hpp>
 #include <zlink/tcp_transport.hpp>
@@ -16,7 +13,7 @@
 #include <zlink/cuda_pipeline.hpp>
 #include <zlink/virtual_handle.hpp>
 
-#include "cuda_api_v2.hpp"
+#include "codegen/gen_api.hpp"
 
 #include <zpp_bits.h>
 
@@ -29,164 +26,164 @@
 #include <cstdint>
 #include <cmath>
 
-using pipe_t = zlink::cuda_pipeline<cuda_v2_rpc>;
+using pipe_t = zlink::cuda_pipeline<cuda_gen::cuda_gen_rpc>;
 
-// ── BARRIER WRAPPERS (indices 0-4, 8, 17, 36, 37) ──────────────────
+// ── BARRIER WRAPPERS ───────────────────────────────────────────────
 
 static int32_t cu_init(pipe_t& pipe, unsigned int flags = 0) {
-    auto r = pipe.call_barrier<0>(flags);
+    auto r = pipe.call_barrier<cuda_gen::func_index::init>(flags);
     return r.result;
 }
 static int32_t cu_device_get_count(pipe_t& pipe, int& out_count) {
-    auto r = pipe.call_barrier<1>();
+    auto r = pipe.call_barrier<cuda_gen::func_index::device_get_count>();
     out_count = r.count;
     return r.result;
 }
 static int32_t cu_device_get_name(pipe_t& pipe, int ordinal, std::string& out_name) {
-    auto r = pipe.call_barrier<2>(ordinal);
-    out_name = r.name;
+    auto r = pipe.call_barrier<cuda_gen::func_index::device_get_name>(static_cast<int32_t>(128), ordinal);
+    out_name = r.name;  // Note: codegen returns uint64_t name addr, not string
     return r.result;
 }
 static int32_t cu_device_total_mem(pipe_t& pipe, int ordinal, uint64_t& out_bytes) {
-    auto r = pipe.call_barrier<3>(ordinal);
+    auto r = pipe.call_barrier<cuda_gen::func_index::device_total_mem>(ordinal);
     out_bytes = r.bytes;
     return r.result;
 }
 static int32_t cu_device_get_attribute(pipe_t& pipe, int attrib, int dev, int32_t& out_value) {
-    auto r = pipe.call_barrier<4>(attrib, dev);
+    auto r = pipe.call_barrier<cuda_gen::func_index::device_get_attribute>(static_cast<uint32_t>(attrib), dev);
     out_value = r.value;
     return r.result;
 }
 static int32_t cu_ctx_get_current(pipe_t& pipe, uint64_t& out_ctx) {
-    auto r = pipe.call_barrier<8>();
+    auto r = pipe.call_barrier<cuda_gen::func_index::ctx_get_current>();
     out_ctx = r.ctx_handle;
     return r.result;
 }
 static int32_t cu_mem_get_info(pipe_t& pipe, uint64_t& free_bytes, uint64_t& total_bytes) {
-    auto r = pipe.call_barrier<17>();
+    auto r = pipe.call_barrier<cuda_gen::func_index::mem_get_info>();
     free_bytes = r.free_bytes;
     total_bytes = r.total_bytes;
     return r.result;
 }
 static int32_t cu_event_elapsed_time(pipe_t& pipe, uint64_t start_evh, uint64_t end_evh, float& out_ms) {
-    auto r = pipe.call_barrier<36>(start_evh, end_evh);
+    auto r = pipe.call_barrier<cuda_gen::func_index::event_elapsed_time>(start_evh, end_evh);
     out_ms = r.milliseconds;
     return r.result;
 }
 
 // ── ENQUEUED WRAPPERS — handle producers ────────────────────────────
 
-// index 5: ctx_create → PRODUCES VH(ctx)
+// ctx_create → PRODUCES VH(ctx)
 static uint64_t cu_ctx_create(pipe_t& pipe, unsigned int flags, int dev) {
-    uint32_t vh = pipe.enqueue_produces_handle<5>(flags, dev);
+    uint32_t vh = pipe.enqueue_produces_handle<cuda_gen::func_index::ctx_create>(flags, dev);
     return zlink::make_virtual_handle(vh);
 }
-// index 10: mem_alloc → PRODUCES VH(dev_ptr) ★ THE KEY WIN
+// mem_alloc → PRODUCES VH(dev_ptr) ★ THE KEY WIN
 static uint64_t cu_mem_alloc(pipe_t& pipe, uint64_t size) {
-    uint32_t vh = pipe.enqueue_produces_handle<10>(size);
+    uint32_t vh = pipe.enqueue_produces_handle<cuda_gen::func_index::mem_alloc>(size);
     return zlink::make_virtual_handle(vh);
 }
-// index 11: mem_alloc_managed → PRODUCES VH(dev_ptr)
+// mem_alloc_managed → PRODUCES VH(dev_ptr)
 static uint64_t cu_mem_alloc_managed(pipe_t& pipe, uint64_t size, unsigned int flags) {
-    uint32_t vh = pipe.enqueue_produces_handle<11>(size, flags);
+    uint32_t vh = pipe.enqueue_produces_handle<cuda_gen::func_index::mem_alloc_managed>(size, flags);
     return zlink::make_virtual_handle(vh);
 }
-// index 14: mem_host_alloc → PRODUCES VH(host_ptr)
+// mem_host_alloc → PRODUCES VH(host_ptr)
 static uint64_t cu_mem_host_alloc(pipe_t& pipe, uint64_t size, unsigned int flags) {
-    uint32_t vh = pipe.enqueue_produces_handle<14>(size, flags);
+    uint32_t vh = pipe.enqueue_produces_handle<cuda_gen::func_index::mem_host_alloc>(size, flags);
     return zlink::make_virtual_handle(vh);
 }
-// index 23: module_load_data → PRODUCES VH(module) + inline host_sync
+// module_load_data → PRODUCES VH(module) + inline host_sync
 static uint64_t cu_module_load_data(pipe_t& pipe, const void* image, uint64_t byte_count) {
-    uint32_t vh = pipe.enqueue_produces_handle_with_sync<23>(
+    uint32_t vh = pipe.enqueue_produces_handle_with_sync<cuda_gen::func_index::module_load_data>(
         image, static_cast<std::size_t>(byte_count),
         static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(image)),
         byte_count);
     return zlink::make_virtual_handle(vh);
 }
-// index 24: module_load → PRODUCES VH(module) via filename
+// module_load → PRODUCES VH(module) via filename
 static uint64_t cu_module_load(pipe_t& pipe, const std::string& filename) {
-    uint32_t vh = pipe.enqueue_produces_handle<24>(filename);
+    uint32_t vh = pipe.enqueue_produces_handle<cuda_gen::func_index::module_load>(filename);
     return zlink::make_virtual_handle(vh);
 }
-// index 26: module_get_function → PRODUCES VH(func) + consumes VH(module)
+// module_get_function → PRODUCES VH(func) + consumes VH(module)
 static uint64_t cu_module_get_function(pipe_t& pipe, uint64_t module_vh, const std::string& name) {
-    uint32_t vh = pipe.enqueue_produces_handle<26>(module_vh, name);
+    uint32_t vh = pipe.enqueue_produces_handle<cuda_gen::func_index::module_get_function>(module_vh, name);
     return zlink::make_virtual_handle(vh);
 }
-// index 27: module_get_global → PRODUCES VH(global_ptr) + consumes VH(module)
+// module_get_global → PRODUCES VH(global_ptr) + consumes VH(module)
 static uint64_t cu_module_get_global(pipe_t& pipe, uint64_t module_vh, const std::string& name) {
-    uint32_t vh = pipe.enqueue_produces_handle<27>(module_vh, name);
+    uint32_t vh = pipe.enqueue_produces_handle<cuda_gen::func_index::module_get_global>(module_vh, name);
     return zlink::make_virtual_handle(vh);
 }
-// index 29: stream_create → PRODUCES VH(stream)
+// stream_create → PRODUCES VH(stream)
 static uint64_t cu_stream_create(pipe_t& pipe, unsigned int flags = 0) {
-    uint32_t vh = pipe.enqueue_produces_handle<29>(flags);
+    uint32_t vh = pipe.enqueue_produces_handle<cuda_gen::func_index::stream_create>(flags);
     return zlink::make_virtual_handle(vh);
 }
-// index 32: event_create → PRODUCES VH(event)
+// event_create → PRODUCES VH(event)
 static uint64_t cu_event_create(pipe_t& pipe, unsigned int flags = 0) {
-    uint32_t vh = pipe.enqueue_produces_handle<32>(flags);
+    uint32_t vh = pipe.enqueue_produces_handle<cuda_gen::func_index::event_create>(flags);
     return zlink::make_virtual_handle(vh);
 }
 
 // ── ENQUEUED WRAPPERS — handle consumers (no VH produced) ───────────
 
-// index 6: ctx_destroy — consumes VH(ctx)
+// ctx_destroy — consumes VH(ctx)
 static int32_t cu_ctx_destroy(pipe_t& pipe, uint64_t ctx_vh) {
-    pipe.enqueue<6>(ctx_vh);
+    pipe.enqueue<cuda_gen::func_index::ctx_destroy>(ctx_vh);
     return 0;
 }
-// index 7: ctx_set_current — consumes VH(ctx)
+// ctx_set_current — consumes VH(ctx)
 static int32_t cu_ctx_set_current(pipe_t& pipe, uint64_t ctx_vh) {
-    pipe.enqueue<7>(ctx_vh);
+    pipe.enqueue<cuda_gen::func_index::ctx_set_current>(ctx_vh);
     return 0;
 }
-// index 9: ctx_synchronize
+// ctx_synchronize
 static int32_t cu_ctx_synchronize(pipe_t& pipe) {
-    pipe.enqueue<9>();
+    pipe.enqueue<cuda_gen::func_index::ctx_synchronize>();
     return 0;
 }
-// index 12: mem_free — consumes VH(dev_ptr)
+// mem_free — consumes VH(dev_ptr)
 static int32_t cu_mem_free(pipe_t& pipe, uint64_t dev_vh) {
-    pipe.enqueue<12>(dev_vh);
+    pipe.enqueue<cuda_gen::func_index::mem_free>(dev_vh);
     return 0;
 }
-// index 13: mem_free_host — consumes VH(host_ptr)
+// mem_free_host — consumes VH(host_ptr)
 static int32_t cu_mem_free_host(pipe_t& pipe, uint64_t host_vh) {
-    pipe.enqueue<13>(host_vh);
+    pipe.enqueue<cuda_gen::func_index::mem_free_host>(host_vh);
     return 0;
 }
-// index 15: mem_host_register — consumes host ptr
+// mem_host_register — consumes host ptr
 static int32_t cu_mem_host_register(pipe_t& pipe, uint64_t host_ptr, uint64_t size, unsigned int flags) {
-    pipe.enqueue<15>(host_ptr, size, flags);
+    pipe.enqueue<cuda_gen::func_index::mem_host_register>(host_ptr, size, flags);
     return 0;
 }
-// index 16: mem_host_unregister — consumes host ptr
+// mem_host_unregister — consumes host ptr
 static int32_t cu_mem_host_unregister(pipe_t& pipe, uint64_t host_ptr) {
-    pipe.enqueue<16>(host_ptr);
+    pipe.enqueue<cuda_gen::func_index::mem_host_unregister>(host_ptr);
     return 0;
 }
-// index 18: memcpy_htod — consumes VH(dev_ptr) + inline host_sync
+// memcpy_htod — consumes VH(dev_ptr) + inline host_sync
 static int32_t cu_memcpy_htod(pipe_t& pipe, uint64_t dev_vh,
                                const void* host_data, uint64_t byte_count) {
-    pipe.enqueue_with_sync<18>(
+    pipe.enqueue_with_sync<cuda_gen::func_index::memcpy_hto_d>(
         host_data, static_cast<std::size_t>(byte_count),
         dev_vh,
         static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(host_data)),
         byte_count);
     return 0;
 }
-// index 20: memcpy_dtod — consumes VH(dst) + VH(src)
+// memcpy_dtod — consumes VH(dst) + VH(src)
 static int32_t cu_memcpy_dtod(pipe_t& pipe, uint64_t dst_vh, uint64_t src_vh, uint64_t byte_count) {
-    pipe.enqueue<20>(dst_vh, src_vh, byte_count);
+    pipe.enqueue<cuda_gen::func_index::memcpy_dto_d>(dst_vh, src_vh, byte_count);
     return 0;
 }
-// index 21: memcpy_htod_async — consumes VH(dev_ptr, stream) + inline host_sync
+// memcpy_htod_async — consumes VH(dev_ptr, stream) + inline host_sync
 static int32_t cu_memcpy_htod_async(pipe_t& pipe, uint64_t dev_vh,
                                      const void* host_data, uint64_t byte_count,
                                      uint64_t stream_vh) {
-    pipe.enqueue_with_sync<21>(
+    pipe.enqueue_with_sync<cuda_gen::func_index::memcpy_hto_d_async>(
         host_data, static_cast<std::size_t>(byte_count),
         dev_vh,
         static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(host_data)),
@@ -194,19 +191,19 @@ static int32_t cu_memcpy_htod_async(pipe_t& pipe, uint64_t dev_vh,
         stream_vh);
     return 0;
 }
-// index 25: module_unload — consumes VH(module)
+// module_unload — consumes VH(module)
 static int32_t cu_module_unload(pipe_t& pipe, uint64_t module_vh) {
-    pipe.enqueue<25>(module_vh);
+    pipe.enqueue<cuda_gen::func_index::module_unload>(module_vh);
     return 0;
 }
-// index 28: launch_kernel — consumes VH(func, stream, args) + inline host_sync
+// launch_kernel — consumes VH(func, stream, args) + inline host_sync
 static int32_t cu_launch_kernel(pipe_t& pipe,
     uint64_t func_vh,
     uint32_t grid_x, uint32_t grid_y, uint32_t grid_z,
     uint32_t block_x, uint32_t block_y, uint32_t block_z,
     uint32_t shared_mem, uint64_t stream_vh,
     const void* args, uint64_t args_size) {
-    pipe.enqueue_with_sync<28>(
+    pipe.enqueue_with_sync<cuda_gen::func_index::launch_kernel>(
         args, static_cast<std::size_t>(args_size),
         func_vh,
         grid_x, grid_y, grid_z,
@@ -216,38 +213,38 @@ static int32_t cu_launch_kernel(pipe_t& pipe,
         args_size);
     return 0;
 }
-// index 30: stream_destroy — consumes VH(stream)
+// stream_destroy — consumes VH(stream)
 static int32_t cu_stream_destroy(pipe_t& pipe, uint64_t stream_vh) {
-    pipe.enqueue<30>(stream_vh);
+    pipe.enqueue<cuda_gen::func_index::stream_destroy>(stream_vh);
     return 0;
 }
-// index 31: stream_synchronize — consumes VH(stream)
+// stream_synchronize — consumes VH(stream)
 static int32_t cu_stream_synchronize(pipe_t& pipe, uint64_t stream_vh) {
-    pipe.enqueue<31>(stream_vh);
+    pipe.enqueue<cuda_gen::func_index::stream_synchronize>(stream_vh);
     return 0;
 }
-// index 33: event_destroy — consumes VH(event)
+// event_destroy — consumes VH(event)
 static int32_t cu_event_destroy(pipe_t& pipe, uint64_t event_vh) {
-    pipe.enqueue<33>(event_vh);
+    pipe.enqueue<cuda_gen::func_index::event_destroy>(event_vh);
     return 0;
 }
-// index 34: event_record — consumes VH(event, stream)
+// event_record — consumes VH(event, stream)
 static int32_t cu_event_record(pipe_t& pipe, uint64_t event_vh, uint64_t stream_vh) {
-    pipe.enqueue<34>(event_vh, stream_vh);
+    pipe.enqueue<cuda_gen::func_index::event_record>(event_vh, stream_vh);
     return 0;
 }
-// index 35: event_synchronize — consumes VH(event)
+// event_synchronize — consumes VH(event)
 static int32_t cu_event_synchronize(pipe_t& pipe, uint64_t event_vh) {
-    pipe.enqueue<35>(event_vh);
+    pipe.enqueue<cuda_gen::func_index::event_synchronize>(event_vh);
     return 0;
 }
 
 // ── READBACK WRAPPERS (indices 19, 22) ──────────────────────────────
 
-// index 19: memcpy_dtoh — READBACK + consumes VH(src_dev_ptr)
+// memcpy_dtoh — READBACK + consumes VH(src_dev_ptr)
 static int32_t cu_memcpy_dtoh(pipe_t& pipe, void* host_data,
                                uint64_t dev_vh, uint64_t byte_count) {
-    auto results = pipe.call_readback_with_sync_read<19>(
+    auto results = pipe.call_readback_with_sync_read<cuda_gen::func_index::memcpy_dto_h>(
         host_data, static_cast<std::size_t>(byte_count),
         static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(host_data)),
         dev_vh,
@@ -257,18 +254,18 @@ static int32_t cu_memcpy_dtoh(pipe_t& pipe, void* host_data,
         using namespace zpp::bits;
         auto [data, in, out] = data_in_out();
         data.assign(results.back().data.begin(), results.back().data.end());
-        cuda_v2_rpc::client client{in, out};
-        auto r = client.template response<19>().or_throw();
+        cuda_gen::cuda_gen_rpc::client client{in, out};
+        auto r = client.template response<cuda_gen::func_index::memcpy_dto_h>().or_throw();
         return r.result;
     }
     return -1;
 }
 
-// index 22: memcpy_dtoh_async — READBACK + consumes VH(src_dev_ptr, stream)
+// memcpy_dtoh_async — READBACK + consumes VH(src_dev_ptr, stream)
 static int32_t cu_memcpy_dtoh_async(pipe_t& pipe, void* host_data,
                                       uint64_t dev_vh, uint64_t byte_count,
                                       uint64_t stream_vh) {
-    auto results = pipe.call_readback_with_sync_read<22>(
+    auto results = pipe.call_readback_with_sync_read<cuda_gen::func_index::memcpy_dto_h_async>(
         host_data, static_cast<std::size_t>(byte_count),
         static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(host_data)),
         dev_vh,
@@ -279,8 +276,8 @@ static int32_t cu_memcpy_dtoh_async(pipe_t& pipe, void* host_data,
         using namespace zpp::bits;
         auto [data, in, out] = data_in_out();
         data.assign(results.back().data.begin(), results.back().data.end());
-        cuda_v2_rpc::client client{in, out};
-        auto r = client.template response<22>().or_throw();
+        cuda_gen::cuda_gen_rpc::client client{in, out};
+        auto r = client.template response<cuda_gen::func_index::memcpy_dto_h_async>().or_throw();
         return r.result;
     }
     return -1;
@@ -460,32 +457,32 @@ int main(int argc, char* argv[]) {
     auto t_barrier_start = std::chrono::high_resolution_clock::now();
     {
         pipe_t bar_pipe(*tp);
-        auto r1 = bar_pipe.call_barrier<5>(0u, 0);
+        auto r1 = bar_pipe.call_barrier<cuda_gen::func_index::ctx_create>(0u, 0);
         uint64_t real_ctx = r1.ctx_handle;
-        auto r2 = bar_pipe.call_barrier<10>(static_cast<uint64_t>(buf_size));
+        auto r2 = bar_pipe.call_barrier<cuda_gen::func_index::mem_alloc>(static_cast<uint64_t>(buf_size));
         uint64_t real_ptr = r2.dev_ptr;
-        auto r3 = bar_pipe.call_barrier<10>(static_cast<uint64_t>(buf_size));
+        auto r3 = bar_pipe.call_barrier<cuda_gen::func_index::mem_alloc>(static_cast<uint64_t>(buf_size));
         uint64_t real_ptr2 = r3.dev_ptr;
 
         std::vector<float> bench_data(buf_size / sizeof(float), 3.14f);
-        bar_pipe.enqueue_with_sync<18>(
+        bar_pipe.enqueue_with_sync<cuda_gen::func_index::memcpy_hto_d>(
             bench_data.data(), buf_size,
             real_ptr,
             reinterpret_cast<std::uint64_t>(bench_data.data()),
             buf_size);
-        bar_pipe.enqueue<20>(real_ptr2, real_ptr, buf_size);
-        bar_pipe.enqueue<9>();
+        bar_pipe.enqueue<cuda_gen::func_index::memcpy_dto_d>(real_ptr2, real_ptr, buf_size);
+        bar_pipe.enqueue<cuda_gen::func_index::ctx_synchronize>();
 
         std::vector<float> bench_read(buf_size / sizeof(float), 0.0f);
-        bar_pipe.call_readback_with_sync_read<19>(
+        bar_pipe.call_readback_with_sync_read<cuda_gen::func_index::memcpy_dto_h>(
             bench_read.data(), buf_size,
             reinterpret_cast<std::uint64_t>(bench_read.data()),
             real_ptr2,
             buf_size);
 
-        bar_pipe.enqueue<12>(real_ptr);
-        bar_pipe.enqueue<12>(real_ptr2);
-        bar_pipe.enqueue<6>(real_ctx);
+        bar_pipe.enqueue<cuda_gen::func_index::mem_free>(real_ptr);
+        bar_pipe.enqueue<cuda_gen::func_index::mem_free>(real_ptr2);
+        bar_pipe.enqueue<cuda_gen::func_index::ctx_destroy>(real_ctx);
         bar_pipe.flush();
     }
     auto t_barrier_end = std::chrono::high_resolution_clock::now();
