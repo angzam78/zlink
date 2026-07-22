@@ -49,7 +49,7 @@ write_fence write_behind_buffer::buffer_write(std::uintptr_t remote_addr,
     }
 
     {
-        std::lock_guard lock(queue_mutex_);
+        std::unique_lock lock(queue_mutex_);
         if (queue_.size() >= cfg_.max_pending_ops) {
             // Back-pressure: block until there's room
             // (In production, you'd want a more sophisticated strategy)
@@ -84,7 +84,7 @@ void write_behind_buffer::drain() {
     // Wait until ALL pending writes are confirmed
     std::uint64_t target;
     {
-        std::lock_guard lock(queue_mutex_);
+        std::unique_lock lock(queue_mutex_);
         target = next_fence_id_.load() - 1;  // Last issued fence
     }
 
@@ -129,7 +129,7 @@ std::size_t write_behind_buffer::pending_bytes() const {
 }
 
 std::size_t write_behind_buffer::pending_ops() const {
-    std::lock_guard lock(queue_mutex_);
+    std::unique_lock lock(queue_mutex_);
     return queue_.size();
 }
 

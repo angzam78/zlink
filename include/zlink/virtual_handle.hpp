@@ -30,6 +30,7 @@
 //   Real ptr:  0x7f18c6c00000 (bit 63 clear)
 
 #include <cstdint>
+#include <cstring>
 #include <unordered_map>
 #include <mutex>
 #include <optional>

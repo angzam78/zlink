@@ -225,6 +225,9 @@ public:
     // Set callback for when a chunk becomes local
     void set_on_chunk_local(on_chunk_local_fn fn) { on_chunk_local_ = std::move(fn); }
 
+    // ── Chunk fetch (used by prefetch_worker) ──────────────────────
+    std::error_code fetch_chunk(std::int64_t chunk_idx);
+
 private:
     // Get chunk index from byte offset
     std::int64_t offset_to_chunk(std::uintptr_t offset) const {
@@ -239,8 +242,7 @@ private:
     // Get or create chunk state
     chunk_state& get_chunk(std::int64_t chunk_idx);
 
-    // Fetch a chunk from remote and store locally
-    std::error_code fetch_chunk(std::int64_t chunk_idx);
+    // (fetch_chunk moved to public)
 
     // Push a single dirty chunk to remote
     std::error_code push_chunk(std::int64_t chunk_idx);
