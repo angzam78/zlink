@@ -25,6 +25,11 @@ enum class frame_type : std::uint8_t {
                                    // → [sync_acks][rpc_replies][read_data...]
     memory_op          = 0x10,  // r3map-inspired remote memory ops
     memory_reply       = 0x11,
+    write_ack          = 0x20,  // Managed pipeline: server ACK for write-behind data
+    prefetch_request   = 0x21,  // Managed pipeline: client requests page prefetch
+    prefetch_response  = 0x22,  // Managed pipeline: server responds with prefetched data
+    session_resume     = 0x30,  // Connection manager: client resumes session after reconnect
+    session_resume_ack = 0x31,  // Connection manager: server confirms session resume
     heartbeat          = 0xFF,
 };
 

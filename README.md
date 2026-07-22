@@ -7,10 +7,12 @@ zlink combines [zpp_bits](https://github.com/eyalz800/zpp_bits) (C++20 binary se
 ## Key Features
 
 - **Dependency-aware CUDA pipeline** — Batches multiple GPU calls into single network round-trips using virtual handles
+- **Managed pipeline** — Prefetch, write-behind, and multiplexed transport sustain throughput at WAN RTTs (3.2x speedup at 10ms RTT)
 - **Virtual handles** — Break the barrier chain: `cuMemAlloc` returns a virtual ID instead of blocking for the real pointer
 - **Inline memory operations** — Host data sync and device data readback are packed into pipeline frames, zero extra round-trips
 - **Zero codegen** — Explicit API declarations with zpp_bits `bind<>`, no Python scripts or generated stubs
 - **Type-safe** — C++20 templates ensure compile-time type safety for all RPC calls
+- **Workload-agnostic** — Managed pipeline benefits any iterative CUDA workload (ML training, compute, transfer, mixed)
 
 ## Architecture
 
@@ -72,6 +74,8 @@ Terminal 2 (client):
 |----------|-------------|
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | System architecture and component overview |
 | [CUDA_PIPELINE.md](docs/CUDA_PIPELINE.md) | Virtual handles and dependency-aware pipelining |
+| [MANAGED_PIPELINE.md](docs/MANAGED_PIPELINE.md) | Managed pipeline architecture (prefetch, write-behind, multiplexed transport) |
+| [MANAGED_PIPELINE_INTEGRATION.md](docs/MANAGED_PIPELINE_INTEGRATION.md) | Step-by-step integration guide for managed pipeline |
 | [WIRE_PROTOCOL.md](docs/WIRE_PROTOCOL.md) | Frame format and network protocol |
 | [MEMORY_SUBSYSTEM.md](docs/MEMORY_SUBSYSTEM.md) | Remote memory, host mirror, chunk cache |
 | [POINTER_MARSHALLING.md](docs/POINTER_MARSHALLING.md) | How pointers cross the network boundary |
@@ -118,17 +122,23 @@ See [WIRE_PROTOCOL.md](docs/WIRE_PROTOCOL.md) for full protocol details.
 ```
 zlink/
 ├── include/zlink/          # Public headers (mostly header-only)
-│   ├── config.hpp          # Protocol constants, frame types
+│   ├── config.hpp          # Protocol constants, frame types (incl. managed pipeline)
 │   ├── transport.hpp       # Abstract transport + frame struct
 │   ├── tcp_transport.hpp   # TCP transport implementation
+│   ├── multiplexed_transport.hpp # 3-channel TCP (RPC/bulk/prefetch) — managed pipeline
 │   ├── rpc.hpp             # RPC engine (client, pipeline, server)
 │   ├── cuda_pipeline.hpp   # Dependency-aware CUDA pipeline
+│   ├── managed_pipeline.hpp # Managed pipeline wrapper (prefetch + write-behind)
 │   ├── virtual_handle.hpp  # Virtual handle system
 │   ├── cuda_dep_spec.hpp   # CUDA API dependency categorization
 │   ├── memory.hpp          # Remote memory subsystem
 │   ├── chunk_cache.hpp     # Page-level cache (r3map-inspired)
+│   ├── prefetch_worker.hpp # Background page prefetch with pattern detection
+│   ├── write_behind_buffer.hpp # Async write-behind with fence sync
+│   ├── connection_manager.hpp # Auto-reconnect + heartbeat + session recovery
 │   ├── shared_mem.hpp      # Shared memory plane
 │   ├── ptr_map.hpp         # Bidirectional pointer mapping
+│   ├── compress.hpp        # LZ4 compression for large payloads
 │   ├── shim.hpp            # LD_PRELOAD shim
 │   ├── client.hpp          # Client framework
 │   └── server.hpp          # Server framework
@@ -138,6 +148,7 @@ zlink/
 │   └── cuda/               # CUDA examples (test client/server)
 ├── tests/                  # Unit tests
 ├── docs/                   # Documentation
+├── sim/                    # Performance simulation + charts
 └── cmake/                  # CMake modules (zpp_bits fetch)
 ```
 
@@ -145,7 +156,7 @@ zlink/
 
 | Project | Approach | Codegen | Generic | Pipelining | Memory | Transport |
 |---------|----------|---------|---------|------------|--------|-----------|
-| **zlink** | RPC pipeline | No | Yes | Virtual handles | Inline sync + demand paging | TCP |
+| **zlink** | RPC pipeline + managed mount | No | Yes | Virtual handles + prefetch + write-behind | Inline sync + demand paging + cache | TCP (3-channel) |
 | **Lupine** | CUDA shim | Yes (Python) | No (CUDA only) | Basic | Handle remap | HTTP/2 |
 | **RCUDA** | CUDA RPC | Yes | No | Basic | Basic | TCP |
 | **SCUDA** | CUDA bridge | Yes (Python) | No | Basic | Basic | TCP |
