@@ -10,7 +10,12 @@
 
 namespace zlink {
 
-write_behind_buffer::write_behind_buffer(transport& bulk_transport, write_behind_config cfg)
+write_behind_buffer::write_behind_buffer(transport& bulk_transport)
+    : transport_(bulk_transport)
+    , cfg_{}
+{}
+
+write_behind_buffer::write_behind_buffer(transport& bulk_transport, const write_behind_config& cfg)
     : transport_(bulk_transport)
     , cfg_(std::move(cfg))
 {}

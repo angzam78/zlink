@@ -61,22 +61,28 @@ public:
     using base_type = cuda_pipeline<RpcDef>;
     using rpc_type  = RpcDef;
 
-    explicit managed_pipeline(multiplexed_transport& mtp,
-                              managed_pipeline_config cfg = {})
+    explicit managed_pipeline(multiplexed_transport& mtp)
         : base_type(mtp)
         , mtransport_(mtp)
-        , cfg_(std::move(cfg))
+        , cfg_{}
     {
-        // Write-behind uses the bulk channel
+        if (cfg_.enable_write_behind) {
+            write_behind_ = std::make_unique<write_behind_buffer>(
+                mtransport_.channel(multiplexed_transport::channel_id::bulk_data));
+        }
+    }
+
+    explicit managed_pipeline(multiplexed_transport& mtp,
+                              const managed_pipeline_config& cfg)
+        : base_type(mtp)
+        , mtransport_(mtp)
+        , cfg_(cfg)
+    {
         if (cfg_.enable_write_behind) {
             write_behind_ = std::make_unique<write_behind_buffer>(
                 mtransport_.channel(multiplexed_transport::channel_id::bulk_data),
                 cfg_.write_behind);
         }
-
-        // Note: prefetch_worker requires a chunk_cache reference.
-        // It will be initialized later via set_cache() when the
-        // cached_memory_client is created.
     }
 
     ~managed_pipeline() {

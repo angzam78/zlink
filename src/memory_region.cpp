@@ -124,8 +124,13 @@ struct cached_memory_client::impl {
 };
 
 cached_memory_client::cached_memory_client(class rpc_client_base& rpc,
+                                           std::size_t region_size)
+    : cached_memory_client(rpc, region_size, chunk_cache_config{})
+{}
+
+cached_memory_client::cached_memory_client(class rpc_client_base& rpc,
                                            std::size_t region_size,
-                                           chunk_cache_config config)
+                                           const chunk_cache_config& config)
     : impl_(std::make_unique<impl>())
     , local_store_(std::make_shared<memory_local_store>(region_size))
 {

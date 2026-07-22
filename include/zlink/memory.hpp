@@ -111,8 +111,10 @@ struct mem_response {
 class cached_memory_client {
 public:
     cached_memory_client(class rpc_client_base& rpc,
+                         std::size_t region_size);
+    cached_memory_client(class rpc_client_base& rpc,
                          std::size_t region_size,
-                         chunk_cache_config config = {});
+                         const chunk_cache_config& config);
     ~cached_memory_client();
 
     // ── Cached read/write ────────────────────────────────────────

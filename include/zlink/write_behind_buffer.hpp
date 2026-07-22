@@ -73,7 +73,8 @@ struct write_behind_config {
 // ── Write-behind buffer ──────────────────────────────────────────────
 class write_behind_buffer {
 public:
-    explicit write_behind_buffer(transport& bulk_transport, write_behind_config cfg = {});
+    explicit write_behind_buffer(transport& bulk_transport);
+    explicit write_behind_buffer(transport& bulk_transport, const write_behind_config& cfg);
     ~write_behind_buffer();
 
     // ── Buffer a write (non-blocking) ────────────────────────────

@@ -6,7 +6,12 @@
 
 namespace zlink {
 
-connection_manager::connection_manager(transport& tp, connection_config cfg)
+connection_manager::connection_manager(transport& tp)
+    : transport_(tp)
+    , cfg_{}
+{}
+
+connection_manager::connection_manager(transport& tp, const connection_config& cfg)
     : transport_(tp)
     , cfg_(std::move(cfg))
 {}

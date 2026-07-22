@@ -49,7 +49,8 @@ public:
         int           listen_backlog      = 64;
     };
 
-    explicit multiplexed_transport(config cfg = {});
+    multiplexed_transport();
+    explicit multiplexed_transport(const config& cfg);
     ~multiplexed_transport() override;
 
     // ── transport interface ──────────────────────────────────────

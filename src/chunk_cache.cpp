@@ -15,8 +15,13 @@ namespace zlink {
 
 // ── Constructor / Destructor ──────────────────────────────────────────
 chunk_cache::chunk_cache(std::shared_ptr<remote_backend> remote,
+                         std::shared_ptr<local_store> local)
+    : chunk_cache(std::move(remote), std::move(local), chunk_cache_config{})
+{}
+
+chunk_cache::chunk_cache(std::shared_ptr<remote_backend> remote,
                          std::shared_ptr<local_store> local,
-                         chunk_cache_config config)
+                         const chunk_cache_config& config)
     : remote_(std::move(remote))
     , local_(std::move(local))
     , config_(config)

@@ -7,7 +7,12 @@
 
 namespace zlink {
 
-prefetch_worker::prefetch_worker(chunk_cache& cache, prefetch_config cfg)
+prefetch_worker::prefetch_worker(chunk_cache& cache)
+    : cache_(cache)
+    , cfg_{}
+{}
+
+prefetch_worker::prefetch_worker(chunk_cache& cache, const prefetch_config& cfg)
     : cache_(cache)
     , cfg_(std::move(cfg))
 {}

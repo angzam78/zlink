@@ -37,7 +37,8 @@ class connection_manager {
 public:
     using recovery_fn = std::function<std::error_code()>;
 
-    explicit connection_manager(transport& tp, connection_config cfg = {});
+    explicit connection_manager(transport& tp);
+    explicit connection_manager(transport& tp, const connection_config& cfg);
     ~connection_manager();
 
     // ── Lifecycle ────────────────────────────────────────────────

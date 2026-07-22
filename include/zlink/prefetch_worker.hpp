@@ -63,7 +63,8 @@ struct prefetch_config {
 
 class prefetch_worker {
 public:
-    prefetch_worker(chunk_cache& cache, prefetch_config cfg = {});
+    prefetch_worker(chunk_cache& cache);
+    prefetch_worker(chunk_cache& cache, const prefetch_config& cfg);
     ~prefetch_worker();
 
     // ── Lifecycle ────────────────────────────────────────────────

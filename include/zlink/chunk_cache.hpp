@@ -172,8 +172,10 @@ public:
     using on_chunk_local_fn = std::function<void(std::int64_t offset)>;
 
     chunk_cache(std::shared_ptr<remote_backend> remote,
+                std::shared_ptr<local_store> local);
+    chunk_cache(std::shared_ptr<remote_backend> remote,
                 std::shared_ptr<local_store> local,
-                chunk_cache_config config = {});
+                const chunk_cache_config& config);
     ~chunk_cache();
 
     // ── Core read/write (SyncedReadWriterAt equivalent) ───────────

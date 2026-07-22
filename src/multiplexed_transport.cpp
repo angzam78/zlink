@@ -12,7 +12,15 @@ static constexpr std::size_t bulk_threshold = 16 * 1024;
 
 // ── Constructor / Destructor ─────────────────────────────────────────
 
-multiplexed_transport::multiplexed_transport(config cfg)
+multiplexed_transport::multiplexed_transport()
+    : cfg_{}
+{
+    for (auto& ch : channels_) {
+        ch = std::make_unique<tcp_transport>();
+    }
+}
+
+multiplexed_transport::multiplexed_transport(const config& cfg)
     : cfg_(std::move(cfg))
 {
     for (auto& ch : channels_) {
