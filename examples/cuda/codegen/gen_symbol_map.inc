@@ -266,6 +266,8 @@ static const char* g_cuda_symbol_names[] = {
     "cuGraphLaunch_ptsz",
     "cuMemAllocFromPoolAsync",
     "cuMemAllocFromPoolAsync_ptsz",
+    "cuMemAllocAsync",
+    "cuMemFreeAsync",
     "cuMemPoolTrimTo",
     "cuMemPoolSetAttribute",
     "cuMemPoolGetAttribute",

@@ -10,17 +10,17 @@
 // break.
 //
 // DESIGN:
-//   - Returns reasonable defaults for most queries
-//   - Forwards memory/device queries to the zlink server when possible
-//   - Falls back to hardcoded values if the server is unreachable
+//   - Uses the same codegen RPC protocol (cuda_gen::cuda_gen_rpc) as the
+//     driver shim and server, sharing the function definitions from gen_api.hpp
+//   - Creates a single persistent connection to the zlink server (reused for
+//     all queries) — no per-query ephemeral connections
+//   - Returns reasonable defaults for non-critical queries (temperature, power)
+//   - For critical queries (device count, memory info), uses real RPC data
 //   - Only implements the subset of NVML that PyTorch actually uses
 //
-// USAGE:
-//   This library is built as libnvidia-ml.so.1 and placed in a
-//   directory that appears first in LD_LIBRARY_PATH, so the dynamic
-//   linker finds it instead of the real NVML library.
+// Client and server always use the same zlink build (no protocol versioning).
 
-#include "cuda_api_v2.hpp"
+#include "codegen/gen_api.hpp"
 
 #include <zlink/transport.hpp>
 #include <zlink/tcp_transport.hpp>
@@ -66,17 +66,11 @@ typedef void* nvmlDevice_t;
 static bool g_nvidia_ml_initialized = false;
 static std::mutex g_nvml_mutex;
 
-// Use the same transport as the CUDA shim if available.
-// The CUDA shim connects to the server; we can share that connection
-// by connecting independently (same server, same port).
+// Single persistent connection to the zlink server (shared across queries)
 static std::unique_ptr<zlink::transport> g_nvml_transport;
 static bool g_nvml_connected = false;
 
-// ── NVML RPC helpers ──────────────────────────────────────────────────
-// We reuse the same cuda_v2_rpc_base protocol to query device info
-// from the server. This way we get accurate memory info, device count,
-// etc. without duplicating the RPC code.
-
+// ── Connect to server (once) ───────────────────────────────────────────
 static void nvml_connect() {
     if (g_nvml_connected) return;
 
@@ -91,54 +85,57 @@ static void nvml_connect() {
         host = host.substr(0, colon);
     }
 
-    // Don't create a second connection — the CUDA shim already has one.
-    // Instead, we'll use the CUDA driver API RPC to query device info.
-    // The NVML shim just needs to return plausible values; for accurate
-    // info, PyTorch can call torch.cuda.mem_get_info() which goes
-    // through the CUDA Driver API shim (cuMemGetInfo).
+    g_nvml_transport = zlink::make_transport(zlink::transport_kind::tcp);
+    auto ec = g_nvml_transport->connect(host, port);
+    if (ec) {
+        std::cerr << "[nvml_shim] Failed to connect to " << host << ":" << port
+                  << ": " << ec.message() << "\n";
+        g_nvml_transport.reset();
+        return;
+    }
+
     g_nvml_connected = true;
+    std::cerr << "[nvml_shim] Connected to " << host << ":" << port << "\n";
 }
 
-// ── Query server for device count via CUDA Driver API ─────────────────
+// ── RPC helper — single persistent connection ──────────────────────────
+template<int FuncIndex, typename... Args>
+static auto nvml_rpc_call(Args&&... args) {
+    std::lock_guard lock(g_nvml_mutex);
+
+    if (!g_nvml_connected) nvml_connect();
+    if (!g_nvml_connected || !g_nvml_transport || !g_nvml_transport->is_connected()) {
+        throw std::runtime_error("nvml_shim: not connected to server");
+    }
+
+    using namespace zpp::bits;
+    auto [data, in, out] = data_in_out();
+    cuda_gen::cuda_gen_rpc::client client{in, out};
+
+    client.template request<FuncIndex>(std::forward<Args>(args)...).or_throw();
+
+    zlink::frame req_frame;
+    req_frame.call_id = 1;
+    req_frame.type = zlink::frame_type::request;
+    req_frame.payload.assign(data.begin(), data.end());
+
+    auto ec = g_nvml_transport->send(req_frame);
+    if (ec) throw std::system_error(ec);
+
+    zlink::frame resp_frame;
+    ec = g_nvml_transport->receive(resp_frame);
+    if (ec) throw std::system_error(ec);
+
+    data.clear();
+    data.assign(resp_frame.payload.begin(), resp_frame.payload.end());
+
+    return client.template response<FuncIndex>().or_throw();
+}
+
+// ── Query server for device count ──────────────────────────────────────
 static int get_server_device_count() {
-    // Try connecting and querying via the CUDA RPC
-    // For now, return 1 (the common case for remote GPU)
-    // TODO: Share the transport with the CUDA shim for efficiency
-    const char* server_env = std::getenv("ZLINK_SERVER");
-    if (!server_env) return 0;
-
     try {
-        std::string host = server_env;
-        std::uint16_t port = zlink::default_port;
-        auto colon = host.find(':');
-        if (colon != std::string::npos) {
-            port = static_cast<std::uint16_t>(std::stoi(host.substr(colon + 1)));
-            host = host.substr(0, colon);
-        }
-
-        auto transport = zlink::make_transport(zlink::transport_kind::tcp);
-        auto ec = transport->connect(host, port);
-        if (ec) return 1; // Default to 1 GPU
-
-        using namespace zpp::bits;
-        auto [data, in, out] = data_in_out();
-        cuda_v2_rpc::client client{in, out};
-        client.template request<v2_func::device_get_count>().or_throw();
-
-        zlink::frame req_frame;
-        req_frame.call_id = 1;
-        req_frame.type = zlink::frame_type::request;
-        req_frame.payload.assign(data.begin(), data.end());
-        transport->send(req_frame);
-
-        zlink::frame resp_frame;
-        transport->receive(resp_frame);
-
-        data.clear();
-        data.assign(resp_frame.payload.begin(), resp_frame.payload.end());
-
-        auto ret = client.template response<v2_func::device_get_count>().or_throw();
-        transport->close();
+        auto ret = nvml_rpc_call<cuda_gen::func_index::device_get_count>();
         return ret.count;
     } catch (...) {
         return 1; // Default to 1 GPU on any error
@@ -147,47 +144,50 @@ static int get_server_device_count() {
 
 // ── Query server for memory info ──────────────────────────────────────
 static bool get_server_memory_info(unsigned long long* free_bytes, unsigned long long* total_bytes) {
-    const char* server_env = std::getenv("ZLINK_SERVER");
-    if (!server_env) return false;
-
     try {
-        std::string host = server_env;
-        std::uint16_t port = zlink::default_port;
-        auto colon = host.find(':');
-        if (colon != std::string::npos) {
-            port = static_cast<std::uint16_t>(std::stoi(host.substr(colon + 1)));
-            host = host.substr(0, colon);
-        }
-
-        auto transport = zlink::make_transport(zlink::transport_kind::tcp);
-        auto ec = transport->connect(host, port);
-        if (ec) return false;
-
-        using namespace zpp::bits;
-        auto [data, in, out] = data_in_out();
-        cuda_v2_rpc::client client{in, out};
-        client.template request<v2_func::mem_get_info>().or_throw();
-
-        zlink::frame req_frame;
-        req_frame.call_id = 1;
-        req_frame.type = zlink::frame_type::request;
-        req_frame.payload.assign(data.begin(), data.end());
-        transport->send(req_frame);
-
-        zlink::frame resp_frame;
-        transport->receive(resp_frame);
-
-        data.clear();
-        data.assign(resp_frame.payload.begin(), resp_frame.payload.end());
-
-        auto ret = client.template response<v2_func::mem_get_info>().or_throw();
-        transport->close();
-
+        auto ret = nvml_rpc_call<cuda_gen::func_index::mem_get_info>();
         *free_bytes = ret.free_bytes;
         *total_bytes = ret.total_bytes;
         return true;
     } catch (...) {
         return false;
+    }
+}
+
+// ── Query server for driver version ───────────────────────────────────
+static std::string get_server_driver_version() {
+    try {
+        auto ret = nvml_rpc_call<cuda_gen::func_index::driver_get_version>();
+        int major = ret.driverVersion / 1000;
+        int minor = (ret.driverVersion % 1000) / 10;
+        return std::to_string(major) + "." + std::to_string(minor);
+    } catch (...) {
+        return "535.129"; // Plausible fallback
+    }
+}
+
+// ── Query server for CUDA driver version ──────────────────────────────
+static int get_server_cuda_driver_version() {
+    try {
+        auto ret = nvml_rpc_call<cuda_gen::func_index::driver_get_version>();
+        return ret.driverVersion;
+    } catch (...) {
+        return 12040; // CUDA 12.4 fallback
+    }
+}
+
+// ── Query server for GPU name ────────────────────────────────────────
+static std::string get_server_gpu_name() {
+    try {
+        // cuDeviceGetName returns a uint64_t address, not a string.
+        // The server writes the name into a local buffer and returns the address.
+        // For NVML purposes, we'll use a generic name since the RPC
+        // doesn't directly return a string payload for DeviceGetName.
+        // The real GPU name is available through torch.cuda.get_device_name()
+        // which goes through the CUDA Driver API shim's cuDeviceGetName.
+        return "NVIDIA GPU (zlink remote)";
+    } catch (...) {
+        return "NVIDIA GPU (zlink remote)";
     }
 }
 
@@ -213,6 +213,11 @@ nvmlReturn_t nvmlInit_v2() {
 
 nvmlReturn_t nvmlShutdown() {
     std::lock_guard lock(g_nvml_mutex);
+    if (g_nvml_transport && g_nvml_transport->is_connected()) {
+        g_nvml_transport->close();
+    }
+    g_nvml_transport.reset();
+    g_nvml_connected = false;
     g_nvidia_ml_initialized = false;
     return NVML_SUCCESS;
 }
@@ -221,18 +226,15 @@ nvmlReturn_t nvmlShutdown() {
 
 nvmlReturn_t nvmlSystemGetDriverVersion(char* version, unsigned int length) {
     if (!version || length == 0) return NVML_ERROR_INVALID_ARGUMENT;
-    // Report a plausible driver version. The actual driver is on the
-    // remote GPU server, but PyTorch mainly uses this for logging.
-    const char* ver = "535.129.03"; // Common recent driver
-    std::strncpy(version, ver, length - 1);
+    auto ver = get_server_driver_version();
+    std::strncpy(version, ver.c_str(), length - 1);
     version[length - 1] = '\0';
     return NVML_SUCCESS;
 }
 
 nvmlReturn_t nvmlSystemGetCudaDriverVersion(int* cudaDriverVersion) {
     if (!cudaDriverVersion) return NVML_ERROR_INVALID_ARGUMENT;
-    // 12000 = CUDA 12.0, encoded as major*1000 + minor*10
-    *cudaDriverVersion = 12010; // CUDA 12.1
+    *cudaDriverVersion = get_server_cuda_driver_version();
     return NVML_SUCCESS;
 }
 
@@ -260,7 +262,6 @@ nvmlReturn_t nvmlDeviceGetCount_v2(unsigned int* deviceCount) {
 
 nvmlReturn_t nvmlDeviceGetHandleByIndex(unsigned int index, nvmlDevice_t* device) {
     if (!device) return NVML_ERROR_INVALID_ARGUMENT;
-    // Use the index as the handle (it's opaque to the caller)
     *device = reinterpret_cast<nvmlDevice_t>(static_cast<std::uintptr_t>(index + 1));
     return NVML_SUCCESS;
 }
@@ -281,10 +282,8 @@ nvmlReturn_t nvmlDeviceGetHandleByPciBusId_v2(const char* pciBusId, nvmlDevice_t
 
 nvmlReturn_t nvmlDeviceGetName(nvmlDevice_t device, char* name, unsigned int length) {
     if (!name || length == 0) return NVML_ERROR_INVALID_ARGUMENT;
-    // Report a generic GPU name. The real name is on the server.
-    // PyTorch uses this primarily for logging/display.
-    const char* gpu_name = "NVIDIA GPU (zlink remote)";
-    std::strncpy(name, gpu_name, length - 1);
+    auto gpu_name = get_server_gpu_name();
+    std::strncpy(name, gpu_name.c_str(), length - 1);
     name[length - 1] = '\0';
     return NVML_SUCCESS;
 }
@@ -314,7 +313,6 @@ nvmlReturn_t nvmlDeviceGetIndex(nvmlDevice_t device, unsigned int* index) {
 }
 
 nvmlReturn_t nvmlDeviceGetPciInfo(nvmlDevice_t device, void* pci) {
-    // nvmlPciInfo_t — just zero it out
     if (pci) std::memset(pci, 0, 256);
     return NVML_SUCCESS;
 }
@@ -332,7 +330,6 @@ nvmlReturn_t nvmlDeviceGetPciInfo_v3(nvmlDevice_t device, void* pci) {
 nvmlReturn_t nvmlDeviceGetMemoryInfo(nvmlDevice_t device, nvmlMemory_t* memory) {
     if (!memory) return NVML_ERROR_INVALID_ARGUMENT;
 
-    // Try to get real memory info from the server
     unsigned long long free_bytes = 0, total_bytes = 0;
     if (get_server_memory_info(&free_bytes, &total_bytes)) {
         memory->total = total_bytes;

@@ -10,11 +10,11 @@
 # PREREQUISITES:
 #   1. PyTorch GPU edition installed (pip install torch --index-url ...)
 #   2. zlink built with CUDA examples: cmake -DZLINK_CUDA_EXAMPLES=ON ..
-#   3. cuda_server_v4 running on the GPU machine
+#   3. cuda_server running on the GPU machine
 #
 # USAGE:
 #   # Start the server on the GPU machine:
-#   ./cuda_server_v4 14833
+#   ./cuda_server
 #
 #   # On the CPU client machine:
 #   export ZLINK_SERVER=gpu-machine:14833
@@ -25,7 +25,7 @@
 #   ┌──────────────────┐         TCP          ┌──────────────────┐
 #   │ CPU Client       │ ───────────────────── │ GPU Server       │
 #   │                  │                       │                  │
-#   │  PyTorch GPU     │                       │  cuda_server_v4  │
+#   │  PyTorch GPU     │                       │  cuda_server     │
 #   │    │             │                       │    │             │
 #   │  libcuda.so.1    │   RPC over TCP        │  real libcuda.so │
 #   │  (zlink shim)    │ ═════════════════════ │  (CUDA driver)   │
@@ -67,8 +67,8 @@ if [ -z "${RUNTIME_DIR}" ]; then
     LIBNVML=$(find "${BUILD_DIR}" -name "libnvidia-ml.so.1" -print -quit 2>/dev/null || true)
 
     if [ -z "${LIBCUDA}" ]; then
-        # Fallback: look for the old-named shim
-        LIBCUDA=$(find "${BUILD_DIR}" -name "cuda_shim_pytorch.so" -print -quit 2>/dev/null || true)
+        # Fallback: broader search pattern
+        LIBCUDA=$(find "${BUILD_DIR}" -name "libcuda.so*" -print -quit 2>/dev/null || true)
     fi
 
     if [ -z "${LIBCUDA}" ]; then
@@ -87,7 +87,7 @@ if [ -z "${RUNTIME_DIR}" ]; then
     if [[ "${LIBCUDA}" == *".so.1" ]]; then
         ln -sf "${LIBCUDA}" "${RUNTIME_DIR}/libcuda.so.1"
     else
-        # Old-named shim: copy it as libcuda.so.1
+        # Non-standard name: copy as libcuda.so.1
         cp "${LIBCUDA}" "${RUNTIME_DIR}/libcuda.so.1"
     fi
 

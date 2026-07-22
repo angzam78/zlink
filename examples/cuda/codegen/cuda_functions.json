@@ -6078,6 +6078,57 @@
       ]
     },
     {
+      "name": "cuMemAllocAsync",
+      "category": "barrier",
+      "comment": "Allocate memory from pool asynchronously — critical for PyTorch CUDA allocator",
+      "params": [
+        {
+          "name": "dptr",
+          "type": "CUdeviceptr*",
+          "direction": "out"
+        },
+        {
+          "name": "bytesize",
+          "type": "size_t",
+          "direction": "in"
+        },
+        {
+          "name": "hStream",
+          "type": "CUstream",
+          "direction": "in"
+        }
+      ],
+      "handle_consumes": [
+        "hStream"
+      ],
+      "devptr_produces": [
+        "dptr"
+      ]
+    },
+    {
+      "name": "cuMemFreeAsync",
+      "category": "enqueued",
+      "comment": "Free memory allocated with cuMemAllocAsync — critical for PyTorch CUDA allocator",
+      "params": [
+        {
+          "name": "dptr",
+          "type": "CUdeviceptr",
+          "direction": "in"
+        },
+        {
+          "name": "hStream",
+          "type": "CUstream",
+          "direction": "in"
+        }
+      ],
+      "devptr_params": [
+        "dptr"
+      ],
+      "handle_consumes": [
+        "hStream"
+      ]
+    },
+    {
       "name": "cuMemPoolTrimTo",
       "category": "enqueued",
       "params": [

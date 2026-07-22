@@ -6,10 +6,10 @@ This script tests the full PyTorch → CUDA Driver API → zlink → GPU pipelin
 
 Usage (on the CPU client machine):
     export ZLINK_SERVER=gpu-server:9876
-    LD_PRELOAD=/path/to/cuda_shim_pytorch.so python test_pytorch_zlink.py
+    LD_LIBRARY_PATH=/path/to/zlink-cuda-runtime python test_pytorch_zlink.py
 
-This script should be run AFTER starting cuda_server_v4 on the GPU machine:
-    ./cuda_server_v4 9876
+This script should be run AFTER starting cuda_server on the GPU machine:
+    ./cuda_server
 """
 
 import torch

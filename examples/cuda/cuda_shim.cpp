@@ -415,6 +415,82 @@ extern "C" {
 
 } // extern "C"
 
+// ── dlsym override ──────────────────────────────────────────────────────
+// Intercept dlsym() calls so that CUDA symbol lookups find our shim
+// implementations. This is critical for PyTorch and other frameworks that
+// call dlsym(RTLD_NEXT, "cuMemcpyHtoD_v2") or dlsym(RTLD_DEFAULT, "cuMemAlloc").
+// Without this override, RTLD_NEXT would skip our shim and try to find the
+// real CUDA driver (which doesn't exist on the CPU client machine).
+//
+// DESIGN (based on Lupine's approach):
+//   1. Check if the symbol is a CUDA Driver API function (cu* prefix)
+//   2. If yes, look it up in our local symbol map (built from gen_symbol_map.inc)
+//   3. If not found in map, try dlsym on our own library
+//   4. If not a CUDA symbol, delegate to the real dlsym
+//
+// We use __libc_dlsym() to call the real dlsym without recursion.
+// This is a GNU extension available on glibc systems.
+
+extern "C" {
+
+// Declare the real dlsym from libc (bypasses our override)
+extern void* __libc_dlsym(void*, const char*) __attribute__((weak));
+
+void* dlsym(void* handle, const char* symbol) {
+    // First: check if this is a CUDA Driver API symbol we implement
+    // cu* functions where the third character is uppercase
+    if (symbol && symbol[0] == 'c' && symbol[1] == 'u' &&
+        symbol[2] >= 'A' && symbol[2] <= 'Z') {
+        // Look up in our shim's function map
+        auto& symbols = get_local_symbol_map();
+        auto it = symbols.find(symbol);
+        if (it != symbols.end()) {
+            return it->second;
+        }
+        // Not in explicit map — try dlsym on ourselves (our exported symbols)
+        void* self = __libc_dlsym ? __libc_dlsym(RTLD_DEFAULT, "libcuda_so_1_handle") : nullptr;
+        if (!self) {
+            // Try loading ourselves with RTLD_NOLOAD to get a handle
+            self = dlopen("libcuda.so.1", RTLD_NOW | RTLD_NOLOAD);
+            if (self) {
+                void* sym = __libc_dlsym ? __libc_dlsym(self, symbol) : nullptr;
+                if (sym) return sym;
+            }
+        }
+        // Not found — return nullptr (CUDA symbol not supported yet)
+        return nullptr;
+    }
+
+    // Not a CUDA symbol — delegate to real dlsym
+    if (__libc_dlsym) {
+        return __libc_dlsym(handle, symbol);
+    }
+
+    // Fallback: dlopen libdl and get the real dlsym
+    // This should never happen on glibc systems
+    static void* (*real_dlsym_fn)(void*, const char*) = nullptr;
+    if (!real_dlsym_fn) {
+        void* libdl = dlopen("libdl.so.2", RTLD_NOW | RTLD_LOCAL);
+        if (libdl) {
+            // Use dlvsym to get the original dlsym (GLIBC_2.34 removed libdl)
+            real_dlsym_fn = reinterpret_cast<void*(*)(void*, const char*)>(
+                dlvsym(libdl, "dlsym", "GLIBC_2.0"));
+            if (!real_dlsym_fn) {
+                real_dlsym_fn = reinterpret_cast<void*(*)(void*, const char*)>(
+                    dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.34"));
+            }
+        }
+    }
+    if (real_dlsym_fn) {
+        return real_dlsym_fn(handle, symbol);
+    }
+
+    // Last resort: this shouldn't happen
+    return nullptr;
+}
+
+} // extern "C"
+
 // ── Library constructor/destructor ─────────────────────────────────────
 __attribute__((constructor))
 static void shim_init() {

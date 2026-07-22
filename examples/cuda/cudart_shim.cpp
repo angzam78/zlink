@@ -17,7 +17,7 @@
 //     │
 //     │  dlopen("libcuda.so.1") + dlsym("cuMemAlloc", ...)
 //     ▼
-//   libcuda.so.1  ← zlink driver shim (cuda_shim_pytorch.cpp)
+//   libcuda.so.1  ← zlink driver shim (cuda_shim.cpp)
 //     │
 //     │  zlink RPC over TCP
 //     ▼

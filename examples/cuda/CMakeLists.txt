@@ -79,6 +79,7 @@ endif()
 add_library(zlink_cuda_shim SHARED cuda_shim.cpp)
 target_link_libraries(zlink_cuda_shim PRIVATE
     zlink_core
+    dl
 )
 target_include_directories(zlink_cuda_shim PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -112,6 +113,7 @@ target_link_options(zlink_cuda_shim PRIVATE
 add_library(zlink_nvidia_ml_shim SHARED nvidia_ml_shim.cpp)
 target_link_libraries(zlink_nvidia_ml_shim PRIVATE
     zlink_core
+    dl
 )
 target_include_directories(zlink_nvidia_ml_shim PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}

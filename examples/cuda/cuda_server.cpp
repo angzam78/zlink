@@ -8,12 +8,15 @@
 // Runs on the GPU machine. Receives RPC calls from the client shim
 // and executes them on real CUDA hardware.
 //
-// KEY DESIGN:
+// KEY DESIGN (functionally equivalent to Lupine's server):
 //   - gen_api.hpp defines the RPC structs and function bindings
-//   - gen_server.inc contains the handler function bodies
-//   - This file provides: transport, handle table, dispatch loop
-//   - Special functions (cuLaunchKernel, cuGetProcAddress) have manual handlers
+//   - gen_server.inc contains the handler function bodies (cuda_gen namespace)
+//   - zpp::bits server.serve() dispatches to bound handlers automatically
+//   - Special functions (cuLaunchKernel, cuGetProcAddress) override generated
+//     handlers with hand-written implementations
 //   - Client and server always use the same zlink build (no protocol versioning)
+//   - Single client connection (fork-per-client like Lupine can be added later)
+//   - Memory ops (host_sync, host_read) handled alongside RPC requests
 
 #include <zlink/transport.hpp>
 #include <zlink/tcp_transport.hpp>
@@ -45,31 +48,23 @@ static zlink::handle_table g_vhandles;
 static std::uint64_t g_last_produced_handle = 0;
 static bool g_has_produced_handle = false;
 
-struct handle_producer_guard {
-    handle_producer_guard() : produced(false) {}
-    ~handle_producer_guard() { if (produced) g_has_produced_handle = true; }
-    bool produced;
-};
+// ══════════════════════════════════════════════════════════════════════════
+// HAND-WRITTEN SPECIAL HANDLERS
+// ══════════════════════════════════════════════════════════════════════════
+// These override the generated handlers for functions that need complex
+// server-side logic (argument translation, pointer dereferencing, etc.)
 
-// ── Handle producers array ─────────────────────────────────────────────
-// Maps call index → which output field is the produced handle
-// -1 means no handle produced
-struct handle_producer_info {
-    int call_index;
-    int field_offset;   // Offset of the handle field in the return struct
-    const char* type;   // "ctx", "stream", "event", "module", "func", "devptr", etc.
-};
+// ── cuGetProcAddress server-side override ────────────────────────────────
+// This overrides the generated cuda_gen::get_proc_address handler because
+// we need to resolve symbols in the real CUDA driver on this server.
+namespace cuda_gen {
 
-// ── cuGetProcAddress server-side handler ────────────────────────────────
-static cuda_gen::GetProcAddressRet handle_get_proc_address(
-    std::string symbol_name, int32_t cuda_version, std::uint64_t flags) {
-    cuda_gen::GetProcAddressRet ret;
+GetProcAddressRet get_proc_address(std::string symbol_name, int32_t cuda_version, std::uint64_t flags) {
+    GetProcAddressRet ret;
     ret.result = CUDA_ERROR_NOT_FOUND;
     ret.func_ptr = 0;
 
-    // Try to resolve the symbol in the real CUDA driver
     void* real_fn = nullptr;
-    // On the server, we have the real CUDA driver loaded
     CUresult res = cuGetProcAddress(symbol_name.c_str(), &real_fn,
                                      cuda_version, flags, nullptr);
     if (res == CUDA_SUCCESS && real_fn != nullptr) {
@@ -81,22 +76,24 @@ static cuda_gen::GetProcAddressRet handle_get_proc_address(
     return ret;
 }
 
-// ── cuLaunchKernel server-side handler ──────────────────────────────────
-static cuda_gen::LaunchKernelRet handle_launch_kernel(
-    std::uint64_t func_handle,
-    std::uint32_t grid_dim_x, std::uint32_t grid_dim_y, std::uint32_t grid_dim_z,
-    std::uint32_t block_dim_x, std::uint32_t block_dim_y, std::uint32_t block_dim_z,
-    std::uint32_t shared_mem_bytes,
-    std::uint64_t stream_handle,
-    std::uint64_t args_client_addr,
-    std::uint64_t args_byte_count) {
+// ── cuLaunchKernel server-side override ──────────────────────────────────
+// This overrides the generated cuda_gen::launch_kernel handler because
+// we need to translate handles, dereference kernel args from host mirror,
+// and pass them as void** to the real cuLaunchKernel.
+LaunchKernelRet launch_kernel(std::uint64_t func_handle,
+                               std::uint32_t grid_dim_x, std::uint32_t grid_dim_y, std::uint32_t grid_dim_z,
+                               std::uint32_t block_dim_x, std::uint32_t block_dim_y, std::uint32_t block_dim_z,
+                               std::uint32_t shared_mem_bytes,
+                               std::uint64_t stream_handle,
+                               std::uint64_t args_client_addr,
+                               std::uint64_t args_byte_count) {
 
-    cuda_gen::LaunchKernelRet ret;
+    LaunchKernelRet ret;
 
     // Translate function handle
     CUfunction real_func = reinterpret_cast<CUfunction>(g_vhandles.translate(func_handle));
     if (!real_func) {
-        ret.result = CUDA_ERROR_INVALID_VALUE;
+        ret.result = static_cast<int32_t>(CUDA_ERROR_INVALID_VALUE);
         return ret;
     }
 
@@ -105,13 +102,12 @@ static cuda_gen::LaunchKernelRet handle_launch_kernel(
         ? reinterpret_cast<CUstream>(g_vhandles.translate(stream_handle))
         : nullptr;
 
-    // Read the kernel arguments from the host mirror
+    // Read kernel arguments from the host mirror
     int n_args = args_byte_count / sizeof(std::uint64_t);
     std::vector<void*> arg_ptrs(n_args);
     std::vector<std::uint64_t> arg_vals(n_args);
 
     if (n_args > 0) {
-        // Read args from the host mirror
         auto mirror_addr = g_host_mirror.translate(
             static_cast<std::uintptr_t>(args_client_addr));
         if (mirror_addr) {
@@ -141,25 +137,33 @@ static cuda_gen::LaunchKernelRet handle_launch_kernel(
     return ret;
 }
 
+} // namespace cuda_gen
+
 // ══════════════════════════════════════════════════════════════════════════
 // GENERATED SERVER HANDLERS
 // ══════════════════════════════════════════════════════════════════════════
+// These provide implementations for all the function declarations in
+// gen_api.hpp. The hand-written overrides above are defined BEFORE this
+// include so they take precedence (same function names, same namespace).
 #include "codegen/gen_server.inc"
 
 // ══════════════════════════════════════════════════════════════════════════
-// RPC DISPATCH — receives frames and dispatches to handlers
+// RPC DISPATCH SERVER
 // ══════════════════════════════════════════════════════════════════════════
-
-// We use the zpp::bits server dispatch mechanism.
-// The main loop receives a frame, deserializes the request,
-// and calls the appropriate handler based on the function index.
+// Uses zpp::bits server.serve() for automatic dispatch.
+// The gen_api.hpp binding maps function indices to cuda_gen::* handlers.
+// The server receives a request frame, creates a zpp::bits server context,
+// calls serve() which dispatches to the appropriate bound handler,
+// and sends the serialized response back.
 
 class cuda_rpc_server {
 public:
     cuda_rpc_server() = default;
 
     void serve(zlink::transport& transport) {
-        std::cerr << "[server] CUDA RPC server (codegen) listening...\n";
+        std::cerr << "[server] CUDA RPC server (codegen, "
+                  << cuda_gen::func_index::mem_pool_destroy + 1
+                  << " functions) listening...\n";
 
         auto ec = transport.listen("0.0.0.0", zlink::default_port);
         if (ec) {
@@ -189,9 +193,14 @@ public:
                 continue;
             }
 
-            // Handle RPC request
+            // Handle RPC request via zpp::bits dispatch
             if (req_frame.type == zlink::frame_type::request) {
                 handle_rpc_request(transport, req_frame);
+            }
+
+            // Handle pipeline request (batched calls)
+            if (req_frame.type == zlink::frame_type::pipeline_request) {
+                handle_pipeline_request(transport, req_frame);
             }
         }
 
@@ -205,7 +214,9 @@ private:
         zlink::mem_request req;
         std::memcpy(&req, req_frame.payload.data(), sizeof(req));
 
-        std::vector<std::byte> read_data;
+        zlink::frame resp_frame;
+        resp_frame.call_id = 0;
+        resp_frame.type = zlink::frame_type::memory_op;
 
         if (req.op == zlink::mem_op::host_sync) {
             // Client is syncing host memory to us
@@ -214,10 +225,6 @@ private:
                 req_frame.payload.size() - sizeof(req));
             g_host_mirror.sync_page(req.remote_addr, data_span);
 
-            // Send acknowledgement
-            zlink::frame resp_frame;
-            resp_frame.call_id = 0;
-            resp_frame.type = zlink::frame_type::memory_op;
             zlink::mem_response resp;
             resp.status = zlink::error_code::ok;
             resp.size = data_span.size();
@@ -229,10 +236,6 @@ private:
         else if (req.op == zlink::mem_op::host_read) {
             // Client wants to read back from mirrored memory
             auto mirror_addr = g_host_mirror.translate(req.remote_addr);
-
-            zlink::frame resp_frame;
-            resp_frame.call_id = 0;
-            resp_frame.type = zlink::frame_type::memory_op;
 
             zlink::mem_response resp;
             resp.status = zlink::error_code::ok;
@@ -256,37 +259,96 @@ private:
     }
 
     void handle_rpc_request(zlink::transport& transport, const zlink::frame& req_frame) {
-        // Use zpp::bits server dispatch
         using namespace zpp::bits;
 
-        auto data = std::vector<std::byte>(
-            req_frame.payload.begin(), req_frame.payload.end());
+        // Load request data into a fresh context
+        auto [data, in, out] = data_in_out();
+        data.assign(req_frame.payload.begin(), req_frame.payload.end());
 
-        // Reset handle production flag
+        // Create server context and dispatch
+        cuda_gen::cuda_gen_rpc::server server{in, out};
+
+        // Reset handle production flag before dispatch
         g_has_produced_handle = false;
 
-        // Create server-side RPC object
-        cuda_gen::cuda_gen_rpc::server server{data};
+        // serve() deserializes the function index, calls the bound handler,
+        // and serializes the response into the data buffer
+        auto result = server.serve();
+        if (failure(result)) {
+            std::cerr << "[server] RPC dispatch failed\n";
+            // Send error response
+            zlink::frame resp_frame;
+            resp_frame.call_id = req_frame.call_id;
+            resp_frame.type = zlink::frame_type::request;
+            // Return a generic error
+            int32_t error_result = static_cast<int32_t>(CUDA_ERROR_INVALID_VALUE);
+            resp_frame.payload.resize(sizeof(error_result));
+            std::memcpy(resp_frame.payload.data(), &error_result, sizeof(error_result));
+            transport.send(resp_frame);
+            return;
+        }
 
-        // Dispatch to the appropriate handler
-        // The server object will parse the function index and call the
-        // corresponding bound function. But since we need custom handlers
-        // for some functions (launch_kernel, get_proc_address), we
-        // intercept before the default dispatch.
-
-        // TODO: For now, we use a simpler approach — parse the function
-        // index from the serialized data and call the right handler.
-        // A production implementation would use the zpp::bits server
-        // dispatch directly.
-
-        // For the initial version, we'll dispatch manually
-        // This will be replaced with proper zpp::bits server dispatch
-
-        // Send response
+        // Send the serialized response back
         zlink::frame resp_frame;
         resp_frame.call_id = req_frame.call_id;
         resp_frame.type = zlink::frame_type::request;
         resp_frame.payload.assign(data.begin(), data.end());
+        transport.send(resp_frame);
+    }
+
+    void handle_pipeline_request(zlink::transport& transport, const zlink::frame& req_frame) {
+        // Pipeline request: batch of serialized RPC calls
+        // Format: [4B count] [4B len1][req1_data] [4B len2][req2_data] ...
+        // Process each call in order, serialize responses similarly
+
+        if (req_frame.payload.size() < 4) return;
+
+        std::uint32_t count = 0;
+        std::memcpy(&count, req_frame.payload.data(), 4);
+
+        std::size_t offset = 4;
+
+        // Response buffer
+        std::vector<std::byte> resp_payload;
+        std::uint32_t resp_count = 0;
+        resp_payload.resize(4); // Space for count
+
+        for (std::uint32_t i = 0; i < count && offset + 4 <= req_frame.payload.size(); i++) {
+            std::uint32_t len = 0;
+            std::memcpy(&len, req_frame.payload.data() + offset, 4);
+            offset += 4;
+
+            if (offset + len > req_frame.payload.size()) break;
+
+            // Dispatch this individual request
+            using namespace zpp::bits;
+            auto [data, in, out] = data_in_out();
+            data.assign(req_frame.payload.begin() + offset,
+                        req_frame.payload.begin() + offset + len);
+
+            g_has_produced_handle = false;
+
+            cuda_gen::cuda_gen_rpc::server server{in, out};
+            auto result = server.serve();
+
+            offset += len;
+
+            // Serialize response
+            std::uint32_t resp_len = static_cast<std::uint32_t>(data.size());
+            std::size_t old_size = resp_payload.size();
+            resp_payload.resize(old_size + 4 + resp_len);
+            std::memcpy(resp_payload.data() + old_size, &resp_len, 4);
+            std::memcpy(resp_payload.data() + old_size + 4, data.data(), resp_len);
+            resp_count++;
+        }
+
+        // Write response count
+        std::memcpy(resp_payload.data(), &resp_count, 4);
+
+        zlink::frame resp_frame;
+        resp_frame.call_id = req_frame.call_id;
+        resp_frame.type = zlink::frame_type::pipeline_response;
+        resp_frame.payload = resp_payload;
         transport.send(resp_frame);
     }
 };
@@ -297,6 +359,7 @@ private:
 int main(int argc, char* argv[]) {
     std::cerr << "zlink CUDA RPC Server\n";
     std::cerr << "  Covers all CUDA Driver API functions (CUDA 12.4+)\n";
+    std::cerr << "  Client/server from same zlink build — no protocol versioning\n";
 
     // Initialize CUDA
     CUresult res = cuInit(0);
