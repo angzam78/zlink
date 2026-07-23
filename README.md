@@ -27,7 +27,7 @@ zlink combines [zpp_bits](https://github.com/eyalz800/zpp_bits) (C++20 binary se
   │    ↓                      │  RPC channel     │ zpp_bits dispatch         │
   │ Transport (multiplexed)   │ ═════════════►   │ Transport (multiplexed)   │
   │    ↓                      │  ◄═════════════  │    ↓                      │
-  │ write_tracker + chunk_cache│ Bulk channel    │ host_memory_mirror        │
+  │ memory_page_tracker + chunk_cache│ Bulk channel    │ host_memory_mirror        │
   │  (demand paging + cache)  │ ═════════════►   │  (server-side mirror)     │
   │                           │  ◄═════════════  │                           │
   │ Virtual handle allocator  │                  │ Handle table (VH→real)    │
@@ -143,13 +143,9 @@ zlink/
 │   ├── cuda_dep_spec.hpp   # CUDA API dependency categorization
 │   ├── memory.hpp          # Remote memory subsystem
 │   ├── chunk_cache.hpp     # Page-level cache (r3map-inspired)
-│   ├── write_tracker.hpp   # Write tracking: uffd WP / mprotect+SIGSEGV
-│   ├── shared_mem.hpp      # Backend interface (ReadAt/WriteAt/Size/Sync)
+│   ├── memory_page_tracker.hpp # Page tracking + demand paging: uffd WP / mprotect+SIGSEGV
 │   ├── ptr_map.hpp         # Bidirectional pointer mapping
 │   ├── compress.hpp        # LZ4 compression for memory transfers
-│   ├── shim.hpp            # LD_PRELOAD shim
-│   ├── client.hpp          # Client framework
-│   └── server.hpp          # Server framework
 ├── src/                    # Implementation files
 ├── examples/
 │   ├── libmath/            # Remote math example

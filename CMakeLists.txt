@@ -22,7 +22,7 @@ add_library(zlink_core STATIC
     src/memory_region.cpp
     src/chunk_cache.cpp
     src/ptr_map.cpp
-    src/write_tracker.cpp
+    src/memory_page_tracker.cpp
 )
 target_include_directories(zlink_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

@@ -3,10 +3,10 @@
 // Uses the SEPARATE-LAYER MODEL:
 //   - RPC batching over the RPC control channel (multiplexed_transport)
 //   - Memory data over the bulk channel via cached_memory_client
-//   - Demand paging + write tracking via write_tracker
+//   - Demand paging + dirty page tracking via memory_page_tracker
 //     (uffd WP_ASYNC / uffd WP sync / mprotect+SIGSEGV — auto-selected)
 //
-// Host buffers live in a shadow mmap region. The write_tracker transparently
+// Host buffers live in a shadow mmap region. The memory_page_tracker transparently
 // monitors reads (demand-paged fetch from server) and writes (dirty tracking).
 // Before enqueuing cuMemcpyHtoD, flush_dirty() pushes only dirty pages.
 // After cuMemcpyDtoH, reading the shadow region triggers demand paging.
@@ -60,7 +60,6 @@ struct memory_layer {
             throw std::runtime_error("mmap shadow region failed");
         }
 
-#if ZLINK_HAS_USERFAULTFD
         auto ec = mem.enable_demand_paging(
             reinterpret_cast<std::uintptr_t>(shadow_base), region_size);
         if (ec) {
@@ -68,16 +67,10 @@ struct memory_layer {
         } else {
             std::cerr << "[client] demand paging + write tracking enabled\n";
         }
-#else
-        std::cerr << "[client] userfaultfd not compiled — "
-                  << "demand paging disabled\n";
-#endif
     }
 
     ~memory_layer() {
-#if ZLINK_HAS_USERFAULTFD
         mem.disable_demand_paging();
-#endif
         if (shadow_base && shadow_base != MAP_FAILED) {
             ::munmap(shadow_base, shadow_size);
         }
@@ -211,7 +204,7 @@ static int32_t cu_memcpy_dtoh(pipe_t& pipe, memory_layer& mem,
         byte_count);
 
     // Touch each page to trigger demand paging.
-    // The write_tracker's fault handler fetches the page from the server.
+    // The memory_page_tracker's fault handler fetches the page from the server.
     if (r.result == 0) {
         volatile std::byte* p = static_cast<volatile std::byte*>(host_data);
         constexpr std::size_t page_size = 4096;

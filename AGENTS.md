@@ -39,9 +39,9 @@ sleep 3
 - `include/zlink/cuda_pipeline.hpp` — RPC batching + virtual handles (no memory data)
 - `include/zlink/multiplexed_transport.hpp` — 3-channel TCP transport
 - `include/zlink/virtual_handle.hpp` — virtual handle system + manifest serialization
-- `include/zlink/memory.hpp` — host_memory_mirror, mem_request/mem_response
-- `include/zlink/chunk_cache.hpp` — page-level cache (r3map-inspired)
-- `include/zlink/shared_mem.hpp` — backend interface (ReadAt/WriteAt/Size/Sync)
+- `include/zlink/memory.hpp` — cached_memory_client, host_memory_mirror, rpc_remote_backend
+- `include/zlink/chunk_cache.hpp` — page-level cache (r3map-inspired): local_store, remote_backend
+- `include/zlink/memory_page_tracker.hpp` — page tracking + demand paging (uffd WP / mprotect+SIGSEGV)
 - `include/zlink/config.hpp` — frame types, `default_port = 14833`
 - `src/multiplexed_transport.cpp` — channel routing logic
 
@@ -52,6 +52,4 @@ sleep 3
 - `heartbeat` (0xFF)
 
 ## Planned Enhancements
-1. **Write tracking** — mprotect + SIGSEGV handler (lupine-style dirty page tracking)
-2. **Demand paging** — userfaultfd for read-side page faults
-3. **QUIC transport** — migrate from TCP to QUIC streams (3 channels map naturally)
+1. **QUIC transport** — migrate from TCP to QUIC streams (3 channels map naturally)

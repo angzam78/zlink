@@ -1,4 +1,4 @@
-// zlink/write_tracker.cpp — userfaultfd write-protect tracking
+// zlink/memory_page_tracker.cpp — page tracking (uffd WP + mprotect+SIGSEGV)
 //
 // Tier 1: userfaultfd WP + WP_ASYNC  (kernel 6.2+)
 //         Write faults are auto-resolved by the kernel; we only get
@@ -8,7 +8,7 @@
 //         Write faults block until the handler calls UFFDIO_WRITEPROTECT
 //         to unprotect and wake. One ioctl per first-write per page.
 
-#include <zlink/write_tracker.hpp>
+#include <zlink/memory_page_tracker.hpp>
 #include <zlink/config.hpp>
 
 #include <algorithm>
@@ -59,11 +59,11 @@ inline std::uintptr_t page_align_down(std::uintptr_t addr) {
 
 #if ZLINK_HAS_USERFAULTFD
 
-class uffd_write_tracker final : public write_tracker {
+class uffd_memory_page_tracker final : public memory_page_tracker {
 public:
     using fault_callback = std::function<std::vector<std::byte>(std::uintptr_t addr, std::size_t len)>;
 
-    uffd_write_tracker(std::uintptr_t base, std::size_t size,
+    uffd_memory_page_tracker(std::uintptr_t base, std::size_t size,
                        bool wp_async, fault_callback read_fault_cb)
         : base_(base)
         , size_(size)
@@ -76,7 +76,7 @@ public:
         open_uffd();
     }
 
-    ~uffd_write_tracker() override {
+    ~uffd_memory_page_tracker() override {
         running_.store(false, std::memory_order_release);
         if (uffd_ >= 0) {
             ::close(uffd_);
@@ -269,11 +269,11 @@ private:
 //    mprotects to PROT_READ|PROT_WRITE
 //  - collect_dirty() re-mprotects dirty pages to PROT_READ
 
-class mprotect_write_tracker final : public write_tracker {
+class mprotect_memory_page_tracker final : public memory_page_tracker {
 public:
     using fault_callback = std::function<std::vector<std::byte>(std::uintptr_t, std::size_t)>;
 
-    mprotect_write_tracker(std::uintptr_t base, std::size_t size,
+    mprotect_memory_page_tracker(std::uintptr_t base, std::size_t size,
                            fault_callback read_fault_cb)
         : base_(base)
         , size_(size)
@@ -292,7 +292,7 @@ public:
         mprotect_region(base_, size_, PROT_NONE);
     }
 
-    ~mprotect_write_tracker() override {
+    ~mprotect_memory_page_tracker() override {
         unregister_tracker(this);
         // Restore full access so munmap/memcpy don't fault
         mprotect_region(base_, size_, PROT_READ | PROT_WRITE);
@@ -412,12 +412,12 @@ private:
         }
     }
 
-    static void register_tracker(mprotect_write_tracker* t) {
+    static void register_tracker(mprotect_memory_page_tracker* t) {
         std::lock_guard lock(s_registry_mutex_);
         s_registry_.push_back(t);
     }
 
-    static void unregister_tracker(mprotect_write_tracker* t) {
+    static void unregister_tracker(mprotect_memory_page_tracker* t) {
         std::lock_guard lock(s_registry_mutex_);
         s_registry_.erase(
             std::remove(s_registry_.begin(), s_registry_.end(), t),
@@ -434,13 +434,13 @@ private:
     static std::once_flag                          s_once_;
     static struct sigaction                        s_old_handler_;
     static std::mutex                              s_registry_mutex_;
-    static std::vector<mprotect_write_tracker*>    s_registry_;
+    static std::vector<mprotect_memory_page_tracker*>    s_registry_;
 };
 
-std::once_flag                       mprotect_write_tracker::s_once_;
-struct sigaction                     mprotect_write_tracker::s_old_handler_;
-std::mutex                           mprotect_write_tracker::s_registry_mutex_;
-std::vector<mprotect_write_tracker*> mprotect_write_tracker::s_registry_;
+std::once_flag                       mprotect_memory_page_tracker::s_once_;
+struct sigaction                     mprotect_memory_page_tracker::s_old_handler_;
+std::mutex                           mprotect_memory_page_tracker::s_registry_mutex_;
+std::vector<mprotect_memory_page_tracker*> mprotect_memory_page_tracker::s_registry_;
 
 } // anonymous namespace
 
@@ -448,8 +448,8 @@ std::vector<mprotect_write_tracker*> mprotect_write_tracker::s_registry_;
 //  Factory — runtime tier selection
 // ══════════════════════════════════════════════════════════════════════
 
-std::unique_ptr<write_tracker>
-write_tracker::create(std::uintptr_t base, std::size_t size,
+std::unique_ptr<memory_page_tracker>
+memory_page_tracker::create(std::uintptr_t base, std::size_t size,
                        fault_callback read_fault_cb) {
     // Tier 3 is always available, so we always succeed (unless allocation fails).
     // We try uffd first; if it fails, the mprotect tracker takes over.
@@ -459,9 +459,9 @@ write_tracker::create(std::uintptr_t base, std::size_t size,
     // the uffd tracker construction consumes (and destroys) the original.
     auto cb_copy = read_fault_cb;
     try {
-        auto tracker = std::make_unique<uffd_write_tracker>(
+        auto tracker = std::make_unique<uffd_memory_page_tracker>(
             base, size, /*wp_async=*/true,
-            uffd_write_tracker::fault_callback(std::move(read_fault_cb)));
+            uffd_memory_page_tracker::fault_callback(std::move(read_fault_cb)));
         if (tracker->is_valid())
             return tracker;
     } catch (...) {}
@@ -470,9 +470,9 @@ write_tracker::create(std::uintptr_t base, std::size_t size,
 
     // Tier 3: mprotect + SIGSEGV (always available on POSIX)
     try {
-        return std::make_unique<mprotect_write_tracker>(
+        return std::make_unique<mprotect_memory_page_tracker>(
             base, size,
-            mprotect_write_tracker::fault_callback(std::move(read_fault_cb)));
+            mprotect_memory_page_tracker::fault_callback(std::move(read_fault_cb)));
     } catch (...) {}
 
     return nullptr;

@@ -4,7 +4,7 @@
 // RPC BATCHING ONLY — no inline memory data.
 //
 // Memory data moves over a separate layer (cached_memory_client with
-// write_tracker + chunk_cache + userfaultfd demand paging). This pipeline
+// memory_page_tracker + chunk_cache + userfaultfd demand paging). This pipeline
 // carries ONLY serialized RPC calls + the virtual handle manifest.
 //
 // CALL CATEGORIES:

@@ -165,9 +165,7 @@ The `tcp_transport` implementation (in `tcp_transport.cpp`) uses:
 5. Either side calls `close()` to terminate the connection
 
 Currently, the server handles one client connection at a time. The
-`server.hpp` framework has the structure for multiple connections (spawning
-`connection_handler` threads), but the accept loop is not yet fully
-implemented.
+CUDA server (`examples/cuda/cuda_server.cpp`) processes requests sequentially.
 
 ## Error Codes
 

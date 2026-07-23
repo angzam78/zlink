@@ -1,15 +1,14 @@
 // zlink/memory_region.cpp — Remote memory subsystem implementation
 //
-// Now includes:
 //   - cached_memory_client with r3map-style chunk caching
 //   - host_memory_mirror for bidirectional client↔server memory sync
-//   - userfaultfd demand paging that goes through the cache
+//   - demand paging + write tracking via memory_page_tracker
 
 #include <zlink/memory.hpp>
 #include <zlink/rpc.hpp>
 #include <zlink/config.hpp>
 #include <zlink/chunk_cache.hpp>
-#include <zlink/write_tracker.hpp>
+#include <zlink/memory_page_tracker.hpp>
 
 #include <cstring>
 #include <cstdlib>
@@ -17,16 +16,7 @@
 #include <stdexcept>
 #include <algorithm>
 
-#if ZLINK_HAS_USERFAULTFD
-    #include <linux/userfaultfd.h>
-    #include <sys/ioctl.h>
-    #include <sys/mman.h>
-    #include <sys/syscall.h>
-    #include <unistd.h>
-    #include <poll.h>
-    #include <pthread.h>
-    #include <fcntl.h>      // O_CLOEXEC, O_NONBLOCK
-#endif
+#include <sys/mman.h>
 
 namespace zlink {
 
@@ -146,14 +136,7 @@ struct cached_memory_client::impl {
     rpc_client_base* rpc = nullptr;
     std::uintptr_t shadow_base = 0;  // base of the shadow region for addr↔offset translation
 
-#if ZLINK_HAS_USERFAULTFD
-    int uffd = -1;  // kept for compatibility; actual uffd is inside wtracker
-    std::uintptr_t demand_base = 0;
-    std::size_t demand_size = 0;
-    std::atomic<bool> demand_paging_enabled{false};
-#endif
-
-    std::unique_ptr<write_tracker> wtracker;
+    std::unique_ptr<memory_page_tracker> mptracker;
 };
 
 cached_memory_client::cached_memory_client(class rpc_client_base& rpc,
@@ -182,9 +165,7 @@ cached_memory_client::cached_memory_client(class rpc_client_base& rpc,
 }
 
 cached_memory_client::~cached_memory_client() {
-#if ZLINK_HAS_USERFAULTFD
     disable_demand_paging();
-#endif
     stop_background();
 }
 
@@ -249,12 +230,12 @@ std::error_code cached_memory_client::free(std::uintptr_t remote_addr) {
 }
 
 std::size_t cached_memory_client::flush_dirty() {
-    // 1. Collect dirty pages from the write_tracker (uffd WP or mprotect SIGSEGV)
+    // 1. Collect dirty pages from the memory_page_tracker (uffd WP or mprotect SIGSEGV)
     //    and write them into the chunk_cache's local store.
-    //    The write_tracker reports absolute addresses; translate to offsets.
+    //    The memory_page_tracker reports absolute addresses; translate to offsets.
     std::size_t pushed = 0;
-    if (impl_->wtracker) {
-        auto dirty = impl_->wtracker->collect_dirty();
+    if (impl_->mptracker) {
+        auto dirty = impl_->mptracker->collect_dirty();
         for (const auto& r : dirty) {
             std::uintptr_t offset = r.addr - impl_->shadow_base;
             cache_->write(offset, std::span<const std::byte>(
@@ -263,7 +244,7 @@ std::size_t cached_memory_client::flush_dirty() {
         }
     }
 
-    // 2. Push ALL dirty pages (from write_tracker above + any explicit writes)
+    // 2. Push ALL dirty pages (from memory_page_tracker above + any explicit writes)
     //    to the server via the remote backend.
     pushed += cache_->sync_dirty();
 
@@ -292,29 +273,24 @@ void cached_memory_client::stop_background() {
 // resolved from local store with ZERO network traffic. Only the first
 // access of each page triggers a remote fetch.
 
-#if ZLINK_HAS_USERFAULTFD
 std::error_code cached_memory_client::enable_demand_paging(std::uintptr_t base,
                                                             std::size_t size) {
     // Store the shadow region base for address translation.
     impl_->shadow_base = base;
     rpc_backend_->set_base(base);
 
-    // The write_tracker is the SINGLE uffd/mprotect handler for this region.
+    // The memory_page_tracker is the SINGLE uffd/mprotect handler for this region.
     // It handles:
     //   MISSING/read faults  → calls read_fault_cb → fetches via chunk_cache
     //                          → UFFDIO_COPY or mprotect+memcpy (done inside tracker)
     //   WP/write faults      → marks page dirty in internal bitmap
     //
-    // flush_dirty() later calls wtracker->collect_dirty() to get dirty ranges
+    // flush_dirty() later calls mptracker->collect_dirty() to get dirty ranges
     // and pushes them to the server.
     const std::size_t ps = cache_->chunk_size();
 
-    impl_->demand_base = base;
-    impl_->demand_size = size;
-    impl_->demand_paging_enabled.store(true);
-
     // Read-fault callback: fetch page from remote via chunk_cache.
-    // The write_tracker does the UFFDIO_COPY / mprotect+memcpy itself.
+    // The memory_page_tracker does the UFFDIO_COPY / mprotect+memcpy itself.
     // Translate the absolute fault address → offset for chunk_cache.
     auto read_cb = [this, base, ps](std::uintptr_t fault_addr, std::size_t /*len*/)
         -> std::vector<std::byte>
@@ -326,10 +302,9 @@ std::error_code cached_memory_client::enable_demand_paging(std::uintptr_t base,
         return page_data;
     };
 
-    impl_->wtracker = write_tracker::create(base, size, std::move(read_cb));
+    impl_->mptracker = memory_page_tracker::create(base, size, std::move(read_cb));
 
-    if (!impl_->wtracker) {
-        impl_->demand_paging_enabled.store(false);
+    if (!impl_->mptracker) {
         return std::make_error_code(std::errc::not_supported);
     }
 
@@ -337,10 +312,8 @@ std::error_code cached_memory_client::enable_demand_paging(std::uintptr_t base,
 }
 
 void cached_memory_client::disable_demand_paging() {
-    impl_->demand_paging_enabled.store(false);
-    impl_->wtracker.reset();
+    impl_->mptracker.reset();
 }
-#endif // ZLINK_HAS_USERFAULTFD
 
 // ══════════════════════════════════════════════════════════════════════
 //  host_memory_mirror implementation (server side)

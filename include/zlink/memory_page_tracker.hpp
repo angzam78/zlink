@@ -1,5 +1,5 @@
 #pragma once
-// zlink/write_tracker.hpp — Write tracking + demand paging
+// zlink/memory_page_tracker.hpp — Page tracking + demand paging
 //
 // Tracks which pages of a memory region have been written to since the last
 // sync, so flush_dirty() can send only dirty pages to the server.
@@ -51,9 +51,9 @@ struct page_range {
 };
 
 // ── Abstract write tracker ──────────────────────────────────────────────
-class write_tracker {
+class memory_page_tracker {
 public:
-    virtual ~write_tracker() = default;
+    virtual ~memory_page_tracker() = default;
 
     // Write-protect a range of pages (call after syncing pages to server).
     // After this, writes to the range will be tracked.
@@ -73,13 +73,13 @@ public:
     // mmap'd by the caller before calling this.
     //
     // read_fault_cb: called on MISSING (read) faults. The callback should
-    // return the page data for the faulting address. The write_tracker
+    // return the page data for the faulting address. The memory_page_tracker
     // then installs it (UFFDIO_COPY or mprotect+memcpy) and write-protects
     // it for dirty tracking.
     // Return an empty vector to signal failure (fault will be retried).
     using fault_callback = std::function<std::vector<std::byte>(std::uintptr_t addr, std::size_t len)>;
 
-    static std::unique_ptr<write_tracker> create(std::uintptr_t base,
+    static std::unique_ptr<memory_page_tracker> create(std::uintptr_t base,
                                                    std::size_t size,
                                                    fault_callback read_fault_cb = {});
 

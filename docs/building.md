@@ -145,14 +145,14 @@ Cleanup batch flushed: 4 results
 The entire Phase 2 batch (ctx create + 2× alloc + stream + HtoD + DtoD + sync)
 is enqueued with virtual handles and flushed in a single round-trip by the
 `cuMemcpyDtoH` readback call. The `[client] demand paging + write tracking
-enabled` line confirms the write_tracker was initialized; `[client] flushed N
-dirty pages` confirms the write tracker detected dirty pages in the shadow
+enabled` line confirms the memory_page_tracker was initialized; `[client] flushed N
+dirty pages` confirms the page tracker detected dirty pages in the shadow
 region and pushed them to the server.
 
 ### Running in Containers (Docker, Kubernetes)
 
 When `userfaultfd(2)` is blocked by seccomp (the default Docker profile returns
-`EPERM`), the write_tracker transparently falls back to `mprotect` + `SIGSEGV`
+`EPERM`), the memory_page_tracker transparently falls back to `mprotect` + `SIGSEGV`
 (Tier 3). No code changes or configuration are needed — the factory auto-selects
 the best available tier at runtime. The `[client] demand paging + write
 tracking enabled` message confirms the fallback is active.
@@ -173,21 +173,6 @@ To test between two machines:
    ```bash
    ./build/examples/cuda/cuda_client 192.168.1.100 14833
    ```
-
-## Project Configuration
-
-The `zlink.toml` file in the project root is the configuration file for the
-shim layer (LD_PRELOAD mode). It specifies:
-
-- Target library name (e.g., `libcuda.so.1`)
-- Server host and port
-- Symbols to intercept or pass through
-
-Environment variables (alternative to config file):
-
-- `ZLINK_SERVER` — Server host:port (e.g., `gpu-host:14833`)
-- `ZLINK_LIBRARY` — Target library name
-- `ZLINK_CONFIG` — Path to config file
 
 ## CMake Options
 

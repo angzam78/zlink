@@ -153,16 +153,20 @@ public:
     // Stop background threads and flush
     void stop_background();
 
-    // ── Demand paging (Linux/userfaultfd) ────────────────────────
+    // ── Demand paging + write tracking ─────────────────────────────
     // When enabled, page faults on the shadow region automatically
     // trigger reads through the chunk_cache. If the page is cached,
     // the fault is resolved from local store (no network!).
     // If not cached, it fetches from remote and caches for next time.
+    // Write faults are tracked as dirty pages for flush_dirty().
+    //
+    // The memory_page_tracker factory auto-selects the best available tier:
+    //   Tier 1: uffd WP_ASYNC (kernel 6.2+)
+    //   Tier 2: uffd WP sync (kernel 4.11+)
+    //   Tier 3: mprotect + SIGSEGV (any POSIX, including containers)
 
-#if ZLINK_HAS_USERFAULTFD
     std::error_code enable_demand_paging(std::uintptr_t base, std::size_t size);
     void disable_demand_paging();
-#endif
 
     // ── Accessors ────────────────────────────────────────────────
 
@@ -182,14 +186,6 @@ private:
 
     // Local store for caching
     std::shared_ptr<memory_local_store> local_store_;
-
-#if ZLINK_HAS_USERFAULTFD
-    int uffd_ = -1;
-    std::uintptr_t demand_base_ = 0;
-    std::size_t demand_size_ = 0;
-    std::thread fault_thread_;
-    std::atomic<bool> demand_paging_enabled_{false};
-#endif
 };
 
 // ── Host memory mirror (server side) ──────────────────────────────────

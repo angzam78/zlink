@@ -30,7 +30,7 @@ memory transfers flow on a separate channel without blocking RPC traffic.
   │    ↓                      │  RPC channel     │ zpp_bits dispatch         │
   │ Transport (multiplexed)   │ ═════════════►   │ Transport (multiplexed)   │
   │    ↓                      │  ◄═════════════  │    ↓                      │
-  │ write_tracker + chunk_cache│ Bulk channel    │ host_memory_mirror        │
+  │ memory_page_tracker + chunk_cache│ Bulk channel    │ host_memory_mirror        │
   │  (demand paging + cache)  │ ═════════════►   │  (server-side mirror)     │
   │                           │  ◄═════════════  │                           │
   │ Virtual handle allocator  │                  │ Handle table (VH→real)    │
@@ -55,29 +55,23 @@ zlink/
 │   ├── rpc.hpp              # RPC engine (typed client, pipeline caller, server)
 │   ├── ptr_map.hpp          # Bidirectional pointer mapping
 │   ├── memory.hpp           # Remote memory subsystem (host_memory_mirror,
-│   │                        #   mem_request/mem_response, memory_server)
+│   │                        #   cached_memory_client, mem_request/mem_response)
 │   ├── chunk_cache.hpp      # Page-level cache with coherence (r3map-inspired)
-│   ├── write_tracker.hpp    # Write tracking + demand paging: uffd WP / mprotect+SIGSEGV
-│   ├── shared_mem.hpp       # Backend interface (ReadAt/WriteAt/Size/Sync)
+│   ├── memory_page_tracker.hpp    # Page tracking + demand paging: uffd WP / mprotect+SIGSEGV
 │   ├── virtual_handle.hpp   # Virtual handle system (VH encoding, handle_table,
 │   │                        #   handle manifest serialization)
 │   ├── cuda_pipeline.hpp    # Dependency-aware CUDA RPC pipeline (batching only)
 │   ├── cuda_dep_spec.hpp    # CUDA API dependency categorization
-│   ├── compress.hpp         # LZ4 compression for memory transfers
-│   ├── shim.hpp             # LD_PRELOAD shim + symbol interception
-│   ├── client.hpp           # High-level client framework
-│   └── server.hpp           # Server framework (dlopen, function registry)
+│   └── compress.hpp         # LZ4 compression for memory transfers
 ├── src/
 │   ├── tcp_transport.cpp    # TCP framing implementation
 │   ├── multiplexed_transport.cpp  # 3-channel routing
 │   ├── rpc.cpp              # RPC send/receive implementation
-│   ├── memory_region.cpp    # Memory region management
+│   ├── memory_region.cpp    # Memory region management (cached_memory_client +
+│   │                        #   host_memory_mirror + rpc_remote_backend)
 │   ├── chunk_cache.cpp      # Chunk cache implementation
-│   ├── write_tracker.cpp    # Write tracking (uffd WP + mprotect+SIGSEGV)
-│   ├── ptr_map.cpp          # Pointer map implementation
-│   ├── shared_mem.cpp       # Backend interface implementation
-│   ├── server.cpp           # Server framework implementation
-│   └── server_main.cpp      # Server entry point
+│   ├── memory_page_tracker.cpp    # Page tracking (uffd WP + mprotect+SIGSEGV)
+│   └── ptr_map.cpp          # Pointer map implementation
 ├── examples/
 │   ├── libmath/             # Remote libm example
 │   └── cuda/                # CUDA RPC server + pipeline client
@@ -212,9 +206,9 @@ Real ptr: 0x7f18c6c00000 (bit 63 clear)
   Sent alongside `pipeline_request` frames so the server knows which return
   values to register in the handle table.
 
-### 6. Write Tracker (`write_tracker.hpp`, `write_tracker.cpp`)
+### 6. Memory Page Tracker (`memory_page_tracker.hpp`, `memory_page_tracker.cpp`)
 
-The `write_tracker` provides transparent demand paging and write tracking on
+The `memory_page_tracker` provides transparent demand paging and dirty page tracking on
 shadow memory regions. It is the single fault handler for a registered region
 and serves two roles:
 
@@ -227,7 +221,7 @@ and serves two roles:
   dirty. `collect_dirty()` returns the dirty ranges and re-protects them.
 
 **Three-tier runtime selection** (probed at construction time via
-`write_tracker::create()`):
+`memory_page_tracker::create()`):
 
 | Tier | Mechanism | Kernel requirement | When to use |
 |------|-----------|--------------------|-------------|
@@ -239,7 +233,7 @@ The factory tries Tier 1 → Tier 2 → Tier 3 and returns the first that succee
 Tier 3 is always available on POSIX systems, so `create()` only returns
 `nullptr` on memory allocation failure.
 
-**Address translation**: The `write_tracker` works with absolute virtual
+**Address translation**: The `memory_page_tracker` works with absolute virtual
 addresses from the shadow region. The `cached_memory_client` translates these
 to 0-based offsets for `chunk_cache` / `local_store`, and the
 `rpc_remote_backend` translates offsets back to absolute addresses for server
@@ -260,22 +254,11 @@ The memory layer moves host buffer data independently of RPC traffic.
   puller/pusher threads. Provides `SyncedReadWriterAt` semantics: reads pull
   from remote on miss, writes mark pages dirty for background push.
 
-- **`memory_server`** — Server-side handler for memory operations (read, write,
-  alloc, free, host_sync).
+- **`rpc_remote_backend`** — Adapts the memory RPC calls (read_at/write_at)
+  as a `remote_backend` for the chunk_cache. Handles offset→absolute address
+  translation for server communication.
 
-### 8. Backend Interface (`shared_mem.hpp`)
-
-Adapts the r3map Backend interface (`ReadAt/WriteAt/Size/Sync`) for zlink's
-use case. This is the abstraction layer through which all memory data flows.
-Provides:
-
-- **`backend`** — Abstract interface matching r3map's Go Backend
-- **`memory_backend`** — Wraps a local memory span as a backend
-- **`rpc_backend`** — Proxies ReadAt/WriteAt over the zlink RPC transport
-- **`chunked_backend`** — Stores chunks as individual files
-- **`shared_mem_plane`** — Central coordinator for client↔server memory access
-
-### 9. Pointer Map (`ptr_map.hpp`)
+### 8. Pointer Map (`ptr_map.hpp`)
 
 Bidirectional mapping between client-side "fake" pointers and server-side real
 pointers. Supports shadow mmap regions so client pointers look like real
@@ -286,28 +269,6 @@ Key operations:
 - `to_remote(local_ptr)` → look up the real pointer
 - `to_local(remote_ptr)` → look up the local pointer
 - `translate_pointers(span)` → batch translate embedded pointers
-
-### 10. Shim Layer (`shim.hpp`)
-
-LD_PRELOAD-based interception. Key classes:
-
-- **`symbol_interceptor`** — Manages mapping between intercepted symbols and
-  their RPC wrappers. Supports both explicit registration and auto-generation
-  of wrappers for common calling conventions.
-
-- **`opaque_wrapper<Signature>`** — Generic wrapper that serializes arguments,
-  sends RPC, and deserializes responses. Pre-generated for arities 0-16.
-
-### 11. Server Framework (`server.hpp`)
-
-- **`function_registry`** — Maps function names/IDs to real implementations
-  loaded from a shared library via `dlopen`/`dlsym`.
-
-- **`connection_handler`** — Per-connection handler that receives frames and
-  dispatches to registered functions or memory operations.
-
-- **`server`** — Main server class. Opens target library, listens for TCP
-  connections, spawns handler threads.
 
 ## Wire Protocol Summary
 

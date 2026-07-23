@@ -189,22 +189,19 @@ This approach works because:
 3. The server walks the args, translating VH values to real device pointers
 4. CUDA receives real pointers and the kernel runs correctly
 
-## Backend Interface
+## Memory Layer
 
-The `shared_mem_plane` (in `shared_mem.hpp`) and `chunk_cache` (in
-`chunk_cache.hpp`) provide the infrastructure for on-demand memory access
-via the r3map Backend interface:
+The `chunk_cache` (in `chunk_cache.hpp`) and `host_memory_mirror` (in
+`memory.hpp`) provide the infrastructure for on-demand memory access:
 
-1. **`backend` interface** — `ReadAt/WriteAt/Size/Sync`, matching r3map's Go
-   Backend
-2. **`memory_backend`** — Wraps local memory as a backend
-3. **`rpc_backend`** — Proxies ReadAt/WriteAt over the transport
-4. **`shared_mem_plane`** — Coordinates client↔server memory access with
-   lazy fetching and background push/pull
+1. **`local_store`** — Local cache interface (`read_at`/`write_at`/`sync`)
+2. **`remote_backend`** — Remote memory interface (`read_at`/`write_at`/`size`)
+3. **`rpc_remote_backend`** — Proxies read_at/write_at over the zlink transport
+4. **`host_memory_mirror`** — Server-side mirror of client host memory
 
-This enables future enhancements:
-- Demand paging via `userfaultfd` (read-side)
-- Write tracking via `mprotect` + `SIGSEGV` (write-side)
+This enables:
+- Demand paging via `userfaultfd` or `mprotect`+`SIGSEGV` (read-side)
+- Dirty page tracking via `userfaultfd` WP or `mprotect`+`SIGSEGV` (write-side)
 - Page-level caching with coherence (chunk_cache)
 
 ## Summary
