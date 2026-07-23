@@ -466,36 +466,53 @@ Optimize to enqueued only when you're sure it's safe.
 | Function | Category | Handle Role | Notes |
 |----------|----------|-------------|-------|
 | cuInit | barrier | — | First call, check availability |
+| cuDriverGetVersion | barrier | — | Need version string |
 | cuDeviceGet | barrier | — | Need device ordinal |
 | cuDeviceGetCount | barrier | — | Need count for iteration |
 | cuDeviceGetName | barrier | — | Need string back |
 | cuDeviceTotalMem | barrier | — | Need value for alloc planning |
 | cuDeviceGetAttribute | barrier | — | Need value for occupancy calc |
+| cuMemGetInfo | barrier | — | Need free/total for alloc strategy |
 | cuCtxCreate | enqueued | PRODUCES | Returns VH for context |
 | cuCtxDestroy | enqueued | consumes | Takes VH context |
+| cuCtxSetCurrent | enqueued | consumes | Takes VH context |
+| cuCtxGetCurrent | barrier | PRODUCES | Need current ctx |
 | cuCtxSynchronize | enqueued | — | Just a sync point |
 | cuMemAlloc | enqueued | PRODUCES | Returns VH for dev_ptr |
+| cuMemAllocManaged | enqueued | PRODUCES | Returns VH for unified mem ptr |
 | cuMemFree | enqueued | consumes | Takes VH dev_ptr |
 | cuMemcpyHtoD | enqueued | consumes | + inline host_sync |
 | cuMemcpyDtoH | readback | consumes | + inline host_read |
+| cuMemcpyDtoD | enqueued | consumes | Both dev_ptrs are VHs |
 | cuModuleLoadData | enqueued | PRODUCES | + inline host_sync for image |
 | cuModuleGetFunction | enqueued | PROD+CON | Consumes VH module, produces VH func |
 | cuLaunchKernel | enqueued | consumes | VH func, VH stream, VH args |
 | cuStreamCreate | enqueued | PRODUCES | Returns VH for stream |
+| cuStreamDestroy | enqueued | consumes | Takes VH stream |
 | cuStreamSynchronize | enqueued | consumes | Takes VH stream |
 | cuEventCreate | enqueued | PRODUCES | Returns VH for event |
+| cuEventDestroy | enqueued | consumes | Takes VH event |
 | cuEventRecord | enqueued | consumes | VH event + VH stream |
+| cuEventSynchronize | enqueued | consumes | Takes VH event |
 | cuEventElapsedTime | barrier | consumes | Need float value back |
 
 ### Key Insight
 
-With virtual handles, the ONLY true barriers are:
+With virtual handles, the only barriers are functions where the client
+needs a return value to make a decision:
+
 - `cuInit` — need to check if CUDA is available
+- `cuDriverGetVersion` — need version string
 - `cuDeviceGetCount` — need count to decide which GPU to use
+- `cuDeviceGetName` — need name string
+- `cuDeviceTotalMem` — need value for alloc planning
 - `cuDeviceGetAttribute` — need value for occupancy calculations
+- `cuMemGetInfo` — need free/total for alloc strategy
 - `cuEventElapsedTime` — need the float value for profiling
 
-Everything else pipelines. Even error codes are deferred.
+Everything else pipelines. Even error codes are deferred. In a typical
+workload, the barriers are all front-loaded during setup; the hot loop
+is entirely enqueued + one readback.
 
 ## Handle Producers (~30 out of ~2000 CUDA functions)
 

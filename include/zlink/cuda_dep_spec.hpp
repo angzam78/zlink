@@ -26,10 +26,15 @@
 //   Before VH:  cuMemAlloc → BARRIER (must wait for dev_ptr)
 //   After VH:   cuMemAlloc → enqueue_produces_handle → VH(0) → ENQUEUED!
 //
-//   With virtual handles, the ONLY true barriers are:
+//   With virtual handles, the only barriers are functions where the client
+//   needs a return value to make a decision:
 //   - cuInit (need to check if CUDA is available before proceeding)
+//   - cuDriverGetVersion (need version string)
 //   - cuDeviceGetCount (need count to decide which GPU to use)
+//   - cuDeviceGetName (need name string)
+//   - cuDeviceTotalMem (need value for alloc planning)
 //   - cuDeviceGetAttribute (need value for occupancy calculations, etc.)
+//   - cuMemGetInfo (need free/total for alloc strategy)
 //   - cuEventElapsedTime (need the float value for profiling)
 //
 //   Everything else pipelines. Even error codes are deferred.
