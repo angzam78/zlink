@@ -7,17 +7,16 @@
 //   - cuda_gen::* handlers: real CUDA calls; handle producers set
 //     g_last_produced_handle via an RAII guard; handle consumers translate
 //     virtual handles via g_vhandles.
-//   - handle_pipeline_mem(): the core batching path. Parses the handle
-//     manifest BEFORE running RPCs (so handles register under their virtual_id
-//     immediately), applies host sync data (LZ4), runs the RPCs in order, and
-//     packs read data back (LZ4) into a single response frame.
+//   - handle_pipeline_request(): parses the handle manifest BEFORE running
+//     RPCs (so handles register under their virtual_id immediately), then
+//     runs the RPCs in order.
+//   - handle_memory_op(): host_sync (client→server data) and host_read
+//     (server→client data) via the host_memory_mirror.
 
 #include <zlink/transport.hpp>
-#include <zlink/tcp_transport.hpp>
 #include <zlink/multiplexed_transport.hpp>
 #include <zlink/config.hpp>
 #include <zlink/virtual_handle.hpp>
-#include <zlink/compress.hpp>
 #include <zlink/memory.hpp>
 
 #include "cuda_api.hpp"
@@ -199,13 +198,22 @@ MemcpyDtoDRet memcpy_dto_d(uint64_t dst_device, uint64_t src_device, uint64_t by
     return {static_cast<int32_t>(cuMemcpyDtoD(dst, src, static_cast<size_t>(byte_count)))};
 }
 // readback: cuMemcpyDtoH — copy from GPU device to the mirrored client host
-// memory. The client later pulls the bytes back via the host_read in the
-// pipeline_mem response.
+// memory. The client later pulls the bytes back via host_read (or demand paging).
 MemcpyDtoHRet memcpy_dto_h(uint64_t dst_host_addr, uint64_t src_device, uint64_t byte_count) {
     CUdeviceptr src = static_cast<CUdeviceptr>(g_vhandles.translate(src_device));
-    void* dst = nullptr;
-    auto mirror = g_host_mirror.translate(static_cast<std::uintptr_t>(dst_host_addr));
-    if (mirror) dst = reinterpret_cast<void*>(*mirror);
+
+    // Auto-register the mirror region for this address if needed.
+    // The client may not have synced this buffer before (it's a readback target).
+    std::uintptr_t dst_addr = static_cast<std::uintptr_t>(dst_host_addr);
+    auto mirror = g_host_mirror.translate(dst_addr);
+    if (!mirror) {
+        // Create a mirror region covering the readback buffer
+        std::vector<std::byte> dummy(byte_count);
+        g_host_mirror.sync_page(dst_addr, dummy);
+        mirror = g_host_mirror.translate(dst_addr);
+    }
+
+    void* dst = mirror ? reinterpret_cast<void*>(*mirror) : nullptr;
     CUresult r = dst ? cuMemcpyDtoH(dst, src, static_cast<size_t>(byte_count))
                      : static_cast<CUresult>(CUDA_ERROR_INVALID_VALUE);
     return {static_cast<int32_t>(r)};
@@ -303,8 +311,6 @@ public:
                 handle_request(tp, req);
             } else if (req.type == frame_type::pipeline_request) {
                 handle_pipeline_request(tp, req);
-            } else if (req.type == frame_type::pipeline_mem) {
-                handle_pipeline_mem(tp, req);
             } else {
                 std::cerr << "[server] unknown frame type 0x"
                           << std::hex << static_cast<int>(req.type) << std::dec << "\n";
@@ -337,122 +343,34 @@ private:
         send_response(tp, req.call_id, zlink::frame_type::response, data);
     }
 
-    // ── Pipeline request (batch, no handle manifest / no inline sync) ──
+    // ── Pipeline request (batched RPC + virtual handle manifest) ──────
+    // Wire format (pipeline_request):
+    //   [4B rpc_count]
+    //   per rpc: [4B len][rpc_bytes]
+    //   [handle_manifest: 4B count + N × handle_manifest_entry]
+    //
+    // The manifest maps call_index → virtual_id. We parse it BEFORE running
+    // RPCs so that produced handles are registered under their virtual_id
+    // immediately, letting subsequent RPCs in the same batch translate
+    // virtual handles correctly.
     void handle_pipeline_request(zlink::transport& tp, const zlink::frame& req) {
         using namespace zpp::bits;
         if (req.payload.size() < 4) return;
 
-        std::uint32_t count = 0;
-        std::memcpy(&count, req.payload.data(), 4);
-        std::size_t off = 4;
-
-        std::vector<std::byte> resp_payload;
-        resp_payload.resize(4);
-        std::uint32_t resp_count = 0;
-
-        for (std::uint32_t i = 0; i < count && off + 4 <= req.payload.size(); ++i) {
-            std::uint32_t len = 0;
-            std::memcpy(&len, req.payload.data() + off, 4); off += 4;
-            if (off + len > req.payload.size()) break;
-
-            auto [data, in, out] = data_in_out();
-            data.assign(req.payload.begin() + off,
-                        req.payload.begin() + off + len);
-            off += len;
-
-            g_has_produced_handle = false;
-            cuda_gen::cuda_gen_rpc::server server{in, out};
-            (void)server.serve();
-
-            std::uint32_t resp_len = static_cast<std::uint32_t>(data.size());
-            std::size_t prev = resp_payload.size();
-            resp_payload.resize(prev + 4 + resp_len);
-            std::memcpy(resp_payload.data() + prev, &resp_len, 4);
-            std::memcpy(resp_payload.data() + prev + 4, data.data(), resp_len);
-            ++resp_count;
-        }
-        std::memcpy(resp_payload.data(), &resp_count, 4);
-        send_response(tp, req.call_id, zlink::frame_type::pipeline_response, resp_payload);
-    }
-
-    // ── Pipeline_mem: the full virtual-handle + inline-sync path ───────
-    // Request format (see cuda_pipeline.hpp):
-    //   [4B sync_count]
-    //   per sync: [8B addr][8B original_size][1B comp_flag][4B data_size][data...]
-    //   [4B rpc_count]
-    //   per rpc:  [4B len][rpc_bytes]
-    //   [4B read_count]
-    //   per read: [8B addr][8B size]
-    //   [handle_manifest: 4B count + N × handle_manifest_entry]
-    //
-    // Response format:
-    //   [4B rpc_count] per rpc: [4B len][resp_bytes]
-    //   [4B read_count] per read: [4B data_len][1B comp_flag][data...]
-    //
-    // The manifest maps call_index → virtual_id. We parse it BEFORE running
-    // RPCs so that when a handler produces a handle, we can immediately
-    // register it under the virtual_id (not the call_index). This lets
-    // later RPCs in the same batch translate the virtual handle correctly.
-    void handle_pipeline_mem(zlink::transport& tp, const zlink::frame& req) {
-        using namespace zpp::bits;
         auto* p = req.payload.data();
         auto total = req.payload.size();
         std::size_t off = 0;
 
-        // ── 1. Apply host syncs (before RPCs, in order) ──
-        std::uint32_t sync_count = 0;
-        std::memcpy(&sync_count, p + off, 4); off += 4;
+        std::uint32_t count = 0;
+        std::memcpy(&count, p + off, 4);
+        off += 4;
 
-        for (std::uint32_t i = 0; i < sync_count && off + 21 <= total; ++i) {
-            std::uint64_t addr = 0, orig_sz = 0;
-            std::uint8_t comp_flag = 0;
-            std::uint32_t data_size = 0;
-            std::memcpy(&addr, p + off, 8); off += 8;
-            std::memcpy(&orig_sz, p + off, 8); off += 8;
-            std::memcpy(&comp_flag, p + off, 1); off += 1;
-            std::memcpy(&data_size, p + off, 4); off += 4;
-            if (off + data_size > total) break;
-
-            std::vector<std::byte> sync_data;
-            if (comp_flag == zlink::comp_flag_lz4) {
-                sync_data = zlink::decompress(
-                    std::span<const std::byte>(p + off, data_size),
-                    comp_flag, static_cast<std::size_t>(orig_sz));
-            } else {
-                sync_data.assign(p + off, p + off + data_size);
-            }
-            off += data_size;
-            g_host_mirror.sync_page(static_cast<std::uintptr_t>(addr),
-                std::span<const std::byte>(sync_data.data(), sync_data.size()));
-        }
-
-        // ── 2. Parse the handle manifest BEFORE processing RPCs.
-        //    The manifest maps call_index → virtual_id. We need this mapping
-        //    during RPC processing so that produced handles are registered
-        //    under their virtual_id immediately, letting subsequent RPCs in
-        //    the same batch translate virtual handles correctly.
-        //    The frame layout is: syncs, RPCs, reads, manifest. We scan
-        //    forward to locate the manifest, then restart to process RPCs.
-
-        std::uint32_t rpc_count = 0;
-        std::memcpy(&rpc_count, p + off, 4); off += 4;
-
-        // Record RPC start, then skip past RPCs to reach reads
+        // Skip past RPCs to find the manifest at the end
         std::size_t rpc_start = off;
-        for (std::uint32_t i = 0; i < rpc_count && off + 4 <= total; ++i) {
+        for (std::uint32_t i = 0; i < count && off + 4 <= total; ++i) {
             std::uint32_t len = 0;
             std::memcpy(&len, p + off, 4); off += 4;
             off += len;
-        }
-
-        // Skip past reads (save start offset for later processing)
-        std::uint32_t read_count = 0;
-        std::size_t reads_start = off;
-        if (off + 4 <= total) {
-            std::memcpy(&read_count, p + off, 4); off += 4;
-        }
-        for (std::uint32_t i = 0; i < read_count && off + 16 <= total; ++i) {
-            off += 16;  // skip [8B addr][8B size]
         }
 
         // Parse manifest
@@ -463,22 +381,19 @@ private:
                 std::span<const std::byte>(p + off, total - off), manifest_bytes);
         }
 
-        // Build call_index → virtual_id lookup map
+        // Build call_index → virtual_id lookup
         std::unordered_map<std::uint32_t, std::uint32_t> call_to_vhid;
         for (const auto& entry : manifest) {
             call_to_vhid[entry.call_index] = entry.virtual_id;
         }
 
-        // ── 3. Process RPCs in order, registering produced handles ──
-        //    Now that we know the call_index → virtual_id mapping, we register
-        //    each produced handle under its virtual_id immediately, so that
-        //    subsequent RPCs in the same batch can translate it.
-        std::vector<std::byte> rpc_responses;
-        rpc_responses.resize(4);
-        std::uint32_t rpc_resp_count = 0;
+        // Process RPCs in order, registering produced handles
+        std::vector<std::byte> resp_payload;
+        resp_payload.resize(4);
+        std::uint32_t resp_count = 0;
 
         off = rpc_start;
-        for (std::uint32_t i = 0; i < rpc_count && off + 4 <= total; ++i) {
+        for (std::uint32_t i = 0; i < count && off + 4 <= total; ++i) {
             std::uint32_t len = 0;
             std::memcpy(&len, p + off, 4); off += 4;
             if (off + len > total) break;
@@ -499,66 +414,13 @@ private:
             }
 
             std::uint32_t resp_len = static_cast<std::uint32_t>(data.size());
-            std::size_t prev = rpc_responses.size();
-            rpc_responses.resize(prev + 4 + resp_len);
-            std::memcpy(rpc_responses.data() + prev, &resp_len, 4);
-            std::memcpy(rpc_responses.data() + prev + 4, data.data(), resp_len);
-            ++rpc_resp_count;
+            std::size_t prev = resp_payload.size();
+            resp_payload.resize(prev + 4 + resp_len);
+            std::memcpy(resp_payload.data() + prev, &resp_len, 4);
+            std::memcpy(resp_payload.data() + prev + 4, data.data(), resp_len);
+            ++resp_count;
         }
-        std::memcpy(rpc_responses.data(), &rpc_resp_count, 4);
-
-        // ── 4. Fulfill read requests from the host mirror ──
-        std::vector<std::byte> read_responses;
-        read_responses.resize(4);
-        std::uint32_t read_resp_count = 0;
-
-        off = reads_start + 4;  // skip read_count, go to first read entry
-        for (std::uint32_t i = 0; i < read_count && off + 16 <= total; ++i) {
-            std::uint64_t addr = 0, sz = 0;
-            std::memcpy(&addr, p + off, 8); off += 8;
-            std::memcpy(&sz, p + off, 8); off += 8;
-
-            std::vector<std::byte> mirror_data(static_cast<std::size_t>(sz), std::byte{0});
-            auto mirror_addr = g_host_mirror.translate(static_cast<std::uintptr_t>(addr));
-            if (mirror_addr && sz > 0) {
-                std::memcpy(mirror_data.data(),
-                    reinterpret_cast<const void*>(*mirror_addr),
-                    static_cast<std::size_t>(sz));
-            }
-
-            auto compressed = zlink::compress(
-                std::span<const std::byte>(mirror_data.data(),
-                                           static_cast<std::size_t>(sz)));
-
-            std::size_t data_field = (compressed.comp_flag == zlink::comp_flag_lz4)
-                ? 8 + compressed.data.size()
-                : compressed.data.size();
-            std::uint32_t total_len = static_cast<std::uint32_t>(1 + data_field);
-
-            std::size_t prev = read_responses.size();
-            read_responses.resize(prev + 4 + total_len);
-            std::memcpy(read_responses.data() + prev, &total_len, 4);
-            std::size_t w = prev + 4;
-            std::memcpy(read_responses.data() + w, &compressed.comp_flag, 1); w += 1;
-            if (compressed.comp_flag == zlink::comp_flag_lz4) {
-                std::uint64_t orig = compressed.original_size;
-                std::memcpy(read_responses.data() + w, &orig, 8); w += 8;
-                std::memcpy(read_responses.data() + w, compressed.data.data(),
-                            compressed.data.size());
-            } else {
-                std::memcpy(read_responses.data() + w, compressed.data.data(),
-                            compressed.data.size());
-            }
-            ++read_resp_count;
-        }
-        std::memcpy(read_responses.data(), &read_resp_count, 4);
-
-        // ── 5. Combine and send ──
-        std::vector<std::byte> resp_payload;
-        resp_payload.reserve(rpc_responses.size() + read_responses.size());
-        resp_payload.insert(resp_payload.end(), rpc_responses.begin(), rpc_responses.end());
-        resp_payload.insert(resp_payload.end(), read_responses.begin(), read_responses.end());
-
+        std::memcpy(resp_payload.data(), &resp_count, 4);
         send_response(tp, req.call_id, zlink::frame_type::pipeline_response, resp_payload);
     }
 

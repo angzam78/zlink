@@ -18,18 +18,10 @@ enum class frame_type : std::uint8_t {
     request            = 0x01,
     response           = 0x02,
     error              = 0x03,
-    pipeline_request   = 0x04,  // Batched RPC: func,func,func → one frame
+    pipeline_request   = 0x04,  // Batched RPC: func,func,func → one frame (no memory data)
     pipeline_response  = 0x05,  // Batched response: reply,reply,reply → one frame
-    pipeline_mem       = 0x06,  // Pipeline with inline memory ops:
-                                   // [sync_data...][rpc_calls...][read_reqs...]
-                                   // → [sync_acks][rpc_replies][read_data...]
-    memory_op          = 0x10,  // r3map-inspired remote memory ops
+    memory_op          = 0x10,  // Remote memory ops (host_sync, host_read)
     memory_reply       = 0x11,
-    write_ack          = 0x20,  // Managed pipeline: server ACK for write-behind data
-    prefetch_request   = 0x21,  // Managed pipeline: client requests page prefetch
-    prefetch_response  = 0x22,  // Managed pipeline: server responds with prefetched data
-    session_resume     = 0x30,  // Connection manager: client resumes session after reconnect
-    session_resume_ack = 0x31,  // Connection manager: server confirms session resume
     heartbeat          = 0xFF,
 };
 

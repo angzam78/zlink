@@ -1,7 +1,7 @@
-# LZ4 Compression in Pipeline Frames
+# LZ4 Compression for Memory Transfers
 
 zlink uses LZ4 compression to reduce network transfer time for large data
-payloads in pipeline_mem frames. Compression is applied per-entry, with
+payloads on the memory channel. Compression is applied per-entry, with
 automatic threshold and ratio checks to avoid overhead on small or
 incompressible data.
 

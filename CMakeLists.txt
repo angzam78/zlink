@@ -14,19 +14,15 @@ include(cmake/FetchZppBits.cmake)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LZ4 REQUIRED IMPORTED_TARGET liblz4)
 
-# ── Core library (mostly header-only) ──────────────────────────────────
+# ── Core library ───────────────────────────────────────────────────────
 add_library(zlink_core STATIC
     src/tcp_transport.cpp
     src/multiplexed_transport.cpp
     src/rpc.cpp
     src/memory_region.cpp
     src/chunk_cache.cpp
-    src/prefetch_worker.cpp
-    src/write_behind_buffer.cpp
-    src/connection_manager.cpp
     src/ptr_map.cpp
-    src/shared_mem.cpp
-    src/server.cpp
+    src/write_tracker.cpp
 )
 target_include_directories(zlink_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -41,10 +37,6 @@ target_compile_options(zlink_core PRIVATE
     -Wall -Wextra -Wpedantic
     $<$<CONFIG:Release>:-O2>
 )
-
-# ── Server binary ──────────────────────────────────────────────────────
-add_executable(zlink_server src/server_main.cpp)
-target_link_libraries(zlink_server PRIVATE zlink_core)
 
 # ── Examples ───────────────────────────────────────────────────────────
 add_subdirectory(examples/libmath)

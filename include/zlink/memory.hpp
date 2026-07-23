@@ -22,7 +22,7 @@
 //   │ Shadow region (mmap) │               │ Real memory (GPU etc) │
 //   │    ↓                 │               │    ↓                  │
 //   │ ┌──────────────────┐ │               │                      │
-//   │ │  chunk_cache     │ │  ── RPC ──→   │ memory_server        │
+//   │ │  chunk_cache     │ │  ── RPC ──→   │ host_memory_mirror        │
 //   │ │  (local store +  │ │               │ (read/write/alloc/   │
 //   │ │   chunk tracking)│ │               │  free handlers)      │
 //   │ └──────────────────┘ │               │                      │
@@ -60,7 +60,6 @@
 #include <cstdint>
 #include <span>
 #include <memory>
-#include <functional>
 #include <system_error>
 #include <string>
 #include <vector>
@@ -247,54 +246,6 @@ private:
 
     mutable std::mutex mutex_;
     std::vector<region> regions_;
-};
-
-// ── Memory region server ─────────────────────────────────────────────
-// Used by the server side to serve memory operations.
-// The server registers memory regions (e.g., GPU device memory) and
-// handles read/write/alloc/free requests from clients.
-//
-// Now also handles:
-//   - host_sync: client→server page sync for host memory mirroring
-//   - invalidate: server→client invalidation notifications
-class memory_server {
-public:
-    memory_server();
-    ~memory_server();
-
-    // Register a memory region that can be accessed remotely
-    using read_fn  = std::function<std::error_code(std::uintptr_t addr,
-                                                    std::span<std::byte> buf)>;
-    using write_fn = std::function<std::error_code(std::uintptr_t addr,
-                                                    std::span<const std::byte> buf)>;
-    using alloc_fn = std::function<std::error_code(std::size_t size,
-                                                    std::uintptr_t& out_addr)>;
-    using free_fn  = std::function<std::error_code(std::uintptr_t addr)>;
-
-    void set_read_handler(read_fn h);
-    void set_write_handler(write_fn h);
-    void set_alloc_handler(alloc_fn h);
-    void set_free_handler(free_fn h);
-
-    // Handle a memory operation request
-    mem_response handle_request(const mem_request& req,
-                                std::span<const std::byte> write_data,
-                                std::vector<std::byte>& read_data);
-
-    // ── Host memory mirror ───────────────────────────────────────
-
-    // Get the host memory mirror for client→server pointer translation
-    host_memory_mirror& host_mirror() { return host_mirror_; }
-
-    // Handle a host_sync request (client pushing its host memory to server)
-    std::error_code handle_host_sync(std::uintptr_t client_addr,
-                                      std::span<const std::byte> data);
-
-private:
-    struct impl;
-    std::unique_ptr<impl> impl_;
-
-    host_memory_mirror host_mirror_;
 };
 
 } // namespace zlink

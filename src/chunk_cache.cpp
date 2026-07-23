@@ -100,8 +100,11 @@ std::error_code chunk_cache::read(std::uintptr_t offset, std::span<std::byte> bu
 }
 
 // ── Core write (SyncedReadWriterAt.WriteAt equivalent) ────────────────
+//
+// Follows r3map's design: write to local store, mark chunk local + dirty.
+// No remote fetch on partial writes — the caller is the data source.
+// No content comparison — if write() was called, the data changed.
 std::error_code chunk_cache::write(std::uintptr_t offset, std::span<const std::byte> data) {
-    // Handle writes that span multiple chunks
     std::size_t bytes_written = 0;
     while (bytes_written < data.size()) {
         std::int64_t chunk_idx = offset_to_chunk(offset + bytes_written);
@@ -112,44 +115,18 @@ std::error_code chunk_cache::write(std::uintptr_t offset, std::span<const std::b
 
         chunk_state& cs = get_chunk(chunk_idx);
 
-        // If the chunk is not local yet, we need to fetch it first
-        // (write-after-read coherence: can't write partial chunk without
-        //  knowing the rest of the data)
-        if (!cs.local && (offset_in_chunk != 0 || to_write != config_.chunk_size)) {
-            // Fetch the whole chunk first so we can do a partial write
-            std::vector<std::byte> chunk_data(config_.chunk_size);
-            auto ec = remote_->read_at(chunk_off, chunk_data);
-            if (ec) return ec;
+        // Write directly to local store — no remote fetch
+        std::span<const std::byte> write_buf(data.data() + bytes_written, to_write);
+        auto ec = local_->write_at(offset + bytes_written, write_buf);
+        if (ec) return ec;
 
-            // Merge the write into the chunk
-            std::memcpy(chunk_data.data() + offset_in_chunk,
-                        data.data() + bytes_written,
-                        to_write);
-
-            // Write the full chunk to local store
-            ec = local_->write_at(chunk_off, chunk_data);
-            if (ec) return ec;
-
-            cs.local = true;
-        } else {
-            // Write directly to local store
-            std::span<const std::byte> write_buf(data.data() + bytes_written, to_write);
-            auto ec = local_->write_at(offset + bytes_written, write_buf);
-            if (ec) return ec;
-
-            if (!cs.local) {
-                cs.local = true;
-            }
-        }
-
-        // Mark as dirty (r3map's TrackingReadWriterAt)
+        cs.local = true;
         cs.dirty = true;
         {
             std::lock_guard lock(dirty_mutex_);
             dirty_chunks_.insert(chunk_idx);
         }
 
-        // Mark as pushable
         {
             std::lock_guard lock(pushable_mutex_);
             pushable_chunks_.insert(chunk_idx);

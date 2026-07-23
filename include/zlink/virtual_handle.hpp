@@ -128,7 +128,7 @@ private:
 
 // ── Handle manifest entry ─────────────────────────────────────────────
 // Describes which pipeline calls produce handles.
-// Sent alongside the pipeline_mem frame so the server knows
+// Sent alongside the pipeline_request frame so the server knows
 // which return values to register.
 struct handle_manifest_entry {
     std::uint32_t call_index;     // 0-indexed position in the pipeline

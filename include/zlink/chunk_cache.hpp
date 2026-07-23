@@ -205,7 +205,7 @@ public:
     // Stop background threads and flush dirty data
     void stop_background();
 
-    // Manually flush all dirty chunks to remote
+    // Manually flush all dirty chunks to remote (via remote_backend)
     std::size_t sync_dirty();
 
     // ── Query ─────────────────────────────────────────────────────
@@ -225,7 +225,7 @@ public:
     // Set callback for when a chunk becomes local
     void set_on_chunk_local(on_chunk_local_fn fn) { on_chunk_local_ = std::move(fn); }
 
-    // ── Chunk fetch (used by prefetch_worker) ──────────────────────
+    // ── Chunk fetch (used by background puller) ──────────────────
     std::error_code fetch_chunk(std::int64_t chunk_idx);
 
 private:

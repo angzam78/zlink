@@ -10,29 +10,38 @@ zlink is a C++20 framework that wraps any shared library for remote execution
 over TCP. Its primary use case is **GPU-over-IP**: running CUDA workloads on
 CPU-only machines by forwarding GPU calls to a remote server with a real GPU.
 
-The architecture is designed around one core principle: **pipelining that
-always works is better than complex pipelining that sometimes breaks.**
+The architecture separates concerns into two independent layers:
+
+1. **RPC layer** — Batches CUDA calls (metadata only, no memory data) into
+   pipeline frames. Virtual handles eliminate dependencies between calls.
+2. **Memory layer** — Moves host buffer data independently via a backend
+   interface (ReadAt/WriteAt/Sync), with demand paging and write tracking.
+
+This separation is deliberate: RPC frames stay small and fast, while bulk
+memory transfers flow on a separate channel without blocking RPC traffic.
 
 ```
   Client (CPU-only machine)                     Server (GPU machine)
   ┌──────────────────────────┐                  ┌──────────────────────────┐
   │ Application code          │                  │ zlink server              │
   │    ↓                      │                  │    ↓                      │
-  │ cuda_pipeline<RpcDef>     │                  │ handle_pipeline_mem()     │
-  │    ↓                      │                  │    ↓                      │
-  │ zpp_bits serialization    │   TCP frames     │ zpp_bits deserialization  │
-  │    ↓                      │ ═════════════►   │    ↓                      │
-  │ Transport (TCP)           │                  │ Transport (TCP)           │
+  │ cuda_pipeline<RpcDef>     │                  │ handle_pipeline_request() │
+  │  (RPC batching, VH)       │                  │    ↓                      │
+  │    ↓                      │  RPC channel     │ zpp_bits dispatch         │
+  │ Transport (multiplexed)   │ ═════════════►   │ Transport (multiplexed)   │
+  │    ↓                      │  ◄═════════════  │    ↓                      │
+  │ write_tracker + chunk_cache│ Bulk channel    │ host_memory_mirror        │
+  │  (demand paging + cache)  │ ═════════════►   │  (server-side mirror)     │
   │                           │  ◄═════════════  │                           │
-  │ Virtual handle allocator  │   TCP frames     │ Handle table (VH→real)    │
-  │ Host memory mirror client │                  │ Host memory mirror server │
+  │ Virtual handle allocator  │                  │ Handle table (VH→real)    │
   └──────────────────────────┘                  └──────────────────────────┘
 ```
 
 The client application calls CUDA functions exactly as it would with a local
 GPU. Wrapper functions categorize each call by its dependency type, and the
 pipeline automatically batches calls into the fewest possible network
-round-trips.
+round-trips. Memory data for `cuMemcpyHtoD` is synced separately and does not
+block the RPC pipeline.
 
 ## Source Layout
 
@@ -42,31 +51,31 @@ zlink/
 │   ├── config.hpp           # Protocol constants, frame types, error codes
 │   ├── transport.hpp        # Abstract transport interface + frame struct
 │   ├── tcp_transport.hpp    # TCP transport with length-prefixed framing
+│   ├── multiplexed_transport.hpp  # 3-channel TCP (RPC/bulk/prefetch)
 │   ├── rpc.hpp              # RPC engine (typed client, pipeline caller, server)
 │   ├── ptr_map.hpp          # Bidirectional pointer mapping
-│   ├── memory.hpp           # Remote memory subsystem (cached_memory_client,
-│   │                        #   host_memory_mirror, memory_server)
+│   ├── memory.hpp           # Remote memory subsystem (host_memory_mirror,
+│   │                        #   mem_request/mem_response, memory_server)
 │   ├── chunk_cache.hpp      # Page-level cache with coherence (r3map-inspired)
-│   ├── shared_mem.hpp       # Shared memory plane (backend interface)
+│   ├── write_tracker.hpp    # Write tracking + demand paging: uffd WP / mprotect+SIGSEGV
+│   ├── shared_mem.hpp       # Backend interface (ReadAt/WriteAt/Size/Sync)
 │   ├── virtual_handle.hpp   # Virtual handle system (VH encoding, handle_table,
 │   │                        #   handle manifest serialization)
-│   ├── cuda_pipeline.hpp    # Dependency-aware CUDA RPC pipeline
+│   ├── cuda_pipeline.hpp    # Dependency-aware CUDA RPC pipeline (batching only)
 │   ├── cuda_dep_spec.hpp    # CUDA API dependency categorization
-│   ├── compress.hpp         # LZ4 compression for pipeline frames
+│   ├── compress.hpp         # LZ4 compression for memory transfers
 │   ├── shim.hpp             # LD_PRELOAD shim + symbol interception
 │   ├── client.hpp           # High-level client framework
 │   └── server.hpp           # Server framework (dlopen, function registry)
 ├── src/
 │   ├── tcp_transport.cpp    # TCP framing implementation
+│   ├── multiplexed_transport.cpp  # 3-channel routing
 │   ├── rpc.cpp              # RPC send/receive implementation
 │   ├── memory_region.cpp    # Memory region management
 │   ├── chunk_cache.cpp      # Chunk cache implementation
+│   ├── write_tracker.cpp    # Write tracking (uffd WP + mprotect+SIGSEGV)
 │   ├── ptr_map.cpp          # Pointer map implementation
-│   ├── shared_mem.cpp       # Shared memory plane implementation
-│   ├── connection_manager.cpp  # Auto-reconnect + heartbeat
-│   ├── multiplexed_transport.cpp  # 3-channel TCP (RPC/bulk/prefetch)
-│   ├── prefetch_worker.cpp  # Background page prefetch
-│   ├── write_behind_buffer.cpp  # Async write-behind with fence sync
+│   ├── shared_mem.cpp       # Backend interface implementation
 │   ├── server.cpp           # Server framework implementation
 │   └── server_main.cpp      # Server entry point
 ├── examples/
@@ -75,7 +84,6 @@ zlink/
 ├── tests/
 │   ├── test_rpc.cpp         # RPC unit tests
 │   └── test_compress.cpp    # Compression unit tests
-├── sim/                     # Performance simulation + charts
 ├── cmake/
 │   └── FetchZppBits.cmake   # CMake fetch for zpp_bits dependency
 └── docs/                    # Documentation (this directory)
@@ -99,17 +107,32 @@ objects. Each frame has a 9-byte header:
 | `request` | `0x01` | Single synchronous RPC call |
 | `response` | `0x02` | RPC response |
 | `error` | `0x03` | Error response |
-| `pipeline_request` | `0x04` | Batched RPC: multiple calls in one frame |
+| `pipeline_request` | `0x04` | Batched RPC: multiple calls + handle manifest |
 | `pipeline_response` | `0x05` | Batched response for pipeline |
-| `pipeline_mem` | `0x06` | Pipeline with inline memory operations (sync+RPC+reads) |
-| `memory_op` | `0x10` | Remote memory operation |
+| `memory_op` | `0x10` | Remote memory operation (host_sync, host_read) |
 | `memory_reply` | `0x11` | Memory operation response |
 | `heartbeat` | `0xFF` | Keep-alive |
 
 `tcp_transport` implements the transport over TCP sockets with `TCP_NODELAY`
 enabled for minimal latency. All sends are mutex-protected for thread safety.
 
-### 2. RPC Engine (`rpc.hpp`)
+### 2. Multiplexed Transport (`multiplexed_transport.hpp`)
+
+Three logical channels over separate TCP connections, designed for future
+QUIC migration (QUIC streams map naturally to this model):
+
+| Channel | Purpose | Frame types routed here |
+|---------|---------|------------------------|
+| `rpc_control` | Low-latency RPC | `request`, `response`, `error`, `heartbeat` |
+| `bulk_data` | Throughput-sensitive transfers | `pipeline_request`, `pipeline_response`, large `memory_op`/`memory_reply` |
+| `prefetch` | Background page prefetch | (reserved for demand-paging prefetch traffic) |
+
+Routing is automatic: `send()` inspects the frame type and picks the channel.
+Small memory ops (< 16 KB) go on `rpc_control` to avoid connection overhead;
+larger ones go on `bulk_data`. When only a single port is available, the
+transport falls back to a single connection.
+
+### 3. RPC Engine (`rpc.hpp`)
 
 The RPC engine wraps [zpp_bits](https://github.com/eyalz800/zpp_bits) for
 network RPC. Key classes:
@@ -145,10 +168,10 @@ using cuda_gen_rpc = zpp::bits::rpc<
 The integer bind IDs (stored in `func_index::*` constants, 0-29) are the
 wire-level function identifiers. Client and server must use the same IDs.
 
-### 3. CUDA Pipeline (`cuda_pipeline.hpp`)
+### 4. CUDA Pipeline (`cuda_pipeline.hpp`)
 
-The dependency-aware pipeline that makes GPU-over-IP performant. See
-[cuda-pipeline.md](cuda-pipeline.md) for full details.
+The dependency-aware pipeline that makes GPU-over-IP performant. It batches
+RPC calls (metadata only — no memory data) and manages virtual handles.
 
 **Key methods on `cuda_pipeline<RpcDef>`**:
 
@@ -156,18 +179,18 @@ The dependency-aware pipeline that makes GPU-over-IP performant. See
 |--------|----------|----------|
 | `call_barrier<N>(args...)` | barrier | Flush pending calls, send single sync RPC |
 | `enqueue<N>(args...)` | enqueued | Batch into pipeline, no network traffic |
-| `enqueue_with_sync<N>(host_ptr, size, args...)` | enqueued | Batch + inline host_sync data |
 | `enqueue_produces_handle<N>(args...)` | enqueued | Batch + allocate virtual handle ID |
-| `enqueue_produces_handle_with_sync<N>(...)` | enqueued | Combine: sync + handle production |
-| `call_readback<N>(args...)` | readback | Flush + sync RPC |
-| `call_readback_with_sync_read<N>(ptr, size, args...)` | readback | Full DtoH: pre-sync + RPC + read |
-| `flush()` | — | Send all pending calls/syncs as a batch |
-| `flush_with_reads()` | — | Send batch + process read requests |
+| `call_readback<N>(args...)` | readback | Flush + sync RPC (data via `host_read`) |
+| `host_read(ptr, size)` | — | Pull data from server mirror via `memory_op` |
+| `flush()` | — | Send all pending calls as a `pipeline_request` batch |
 
-### 4. Virtual Handle System (`virtual_handle.hpp`)
+Memory data for `cuMemcpyHtoD` is synced separately via the memory layer
+(`host_sync` / `chunk_cache`), not packed into RPC frames.
+
+### 5. Virtual Handle System (`virtual_handle.hpp`)
 
 Breaks the dependency chain by replacing real GPU handles with client-side
-virtual IDs. See [cuda-pipeline.md](cuda-pipeline.md) for the full algorithm.
+virtual IDs.
 
 **Encoding**: Bit 63 set = virtual handle. Lower 63 bits = virtual ID.
 Real CUDA pointers are always < 2^63, so this is safe and unambiguous.
@@ -186,13 +209,45 @@ Real ptr: 0x7f18c6c00000 (bit 63 clear)
 - **`virtual_handle_allocator`** — Client-side sequential ID allocator.
 
 - **`handle_manifest_entry`** — Describes which pipeline calls produce handles.
-  Sent alongside `pipeline_mem` frames so the server knows which return values
-  to register in the handle table.
+  Sent alongside `pipeline_request` frames so the server knows which return
+  values to register in the handle table.
 
-### 5. Memory Subsystem (`memory.hpp`, `chunk_cache.hpp`)
+### 6. Write Tracker (`write_tracker.hpp`, `write_tracker.cpp`)
 
-The remote memory subsystem provides transparent access to memory on the other
-side of the network. See [memory.md](memory.md) for full details.
+The `write_tracker` provides transparent demand paging and write tracking on
+shadow memory regions. It is the single fault handler for a registered region
+and serves two roles:
+
+- **Read-side demand paging**: When a page is first accessed (MISSING fault /
+  PROT_NONE), the tracker calls a `read_fault_cb` callback that fetches the
+  page from the server via `chunk_cache`. The tracker then installs the page
+  (UFFDIO_COPY for uffd, `mprotect` + `memcpy` for the fallback).
+- **Write-side dirty tracking**: After a page is installed, it is
+  write-protected. On the next write, a WP fault fires and the page is marked
+  dirty. `collect_dirty()` returns the dirty ranges and re-protects them.
+
+**Three-tier runtime selection** (probed at construction time via
+`write_tracker::create()`):
+
+| Tier | Mechanism | Kernel requirement | When to use |
+|------|-----------|--------------------|-------------|
+| 1 | userfaultfd WP + `WP_ASYNC` | Linux 6.2+ | Best performance — write faults auto-resolved by kernel, zero ioctls per write |
+| 2 | userfaultfd WP synchronous | Linux 4.11+ | Standard — one `UFFDIO_WRITEPROTECT` ioctl per first-write per page |
+| 3 | mprotect + SIGSEGV | Any POSIX | Fallback — works in containers where seccomp blocks `userfaultfd(2)` (e.g., default Docker profile) |
+
+The factory tries Tier 1 → Tier 2 → Tier 3 and returns the first that succeeds.
+Tier 3 is always available on POSIX systems, so `create()` only returns
+`nullptr` on memory allocation failure.
+
+**Address translation**: The `write_tracker` works with absolute virtual
+addresses from the shadow region. The `cached_memory_client` translates these
+to 0-based offsets for `chunk_cache` / `local_store`, and the
+`rpc_remote_backend` translates offsets back to absolute addresses for server
+communication (`host_sync` / `host_read`).
+
+### 7. Memory Subsystem (`memory.hpp`, `chunk_cache.hpp`)
+
+The memory layer moves host buffer data independently of RPC traffic.
 
 **Key classes**:
 
@@ -201,17 +256,18 @@ side of the network. See [memory.md](memory.md) for full details.
   data is stored in the server's mirror region and the client address is
   translated to a server-local address that CUDA functions can dereference.
 
-- **`cached_memory_client`** — Client-side cached access to remote memory.
-  Uses `chunk_cache` for page-level caching: first fetch goes to remote,
-  subsequent reads are served from local cache with zero network overhead.
+- **`chunk_cache`** — Page-level cache (r3map-inspired) with background
+  puller/pusher threads. Provides `SyncedReadWriterAt` semantics: reads pull
+  from remote on miss, writes mark pages dirty for background push.
 
 - **`memory_server`** — Server-side handler for memory operations (read, write,
   alloc, free, host_sync).
 
-### 6. Shared Memory Plane (`shared_mem.hpp`)
+### 8. Backend Interface (`shared_mem.hpp`)
 
 Adapts the r3map Backend interface (`ReadAt/WriteAt/Size/Sync`) for zlink's
-use case. Provides:
+use case. This is the abstraction layer through which all memory data flows.
+Provides:
 
 - **`backend`** — Abstract interface matching r3map's Go Backend
 - **`memory_backend`** — Wraps a local memory span as a backend
@@ -219,7 +275,7 @@ use case. Provides:
 - **`chunked_backend`** — Stores chunks as individual files
 - **`shared_mem_plane`** — Central coordinator for client↔server memory access
 
-### 7. Pointer Map (`ptr_map.hpp`)
+### 9. Pointer Map (`ptr_map.hpp`)
 
 Bidirectional mapping between client-side "fake" pointers and server-side real
 pointers. Supports shadow mmap regions so client pointers look like real
@@ -231,7 +287,7 @@ Key operations:
 - `to_local(remote_ptr)` → look up the local pointer
 - `translate_pointers(span)` → batch translate embedded pointers
 
-### 8. Shim Layer (`shim.hpp`)
+### 10. Shim Layer (`shim.hpp`)
 
 LD_PRELOAD-based interception. Key classes:
 
@@ -242,7 +298,7 @@ LD_PRELOAD-based interception. Key classes:
 - **`opaque_wrapper<Signature>`** — Generic wrapper that serializes arguments,
   sends RPC, and deserializes responses. Pre-generated for arities 0-16.
 
-### 9. Server Framework (`server.hpp`)
+### 11. Server Framework (`server.hpp`)
 
 - **`function_registry`** — Maps function names/IDs to real implementations
   loaded from a shared library via `dlopen`/`dlsym`.
@@ -262,33 +318,23 @@ Client → Server:  [frame: type=request,  payload=zpp_bits(request)]
 Server → Client:  [frame: type=response, payload=zpp_bits(response)]
 ```
 
-### Pipeline Batch
+### Pipeline Batch (RPC only, no memory data)
 
 ```
 Client → Server:  [frame: type=pipeline_request,
-                    payload=[4B count][4B len1][req1][4B len2][req2]...]
+                    payload=[4B count][4B len1][req1][4B len2][req2]...
+                              [handle_manifest: 4B count + N × handle_manifest_entry]]
 Server → Client:  [frame: type=pipeline_response,
                     payload=[4B count][4B len1][resp1][4B len2][resp2]...]
 ```
 
-### Pipeline with Memory Ops (pipeline_mem)
+### Memory Operation (separate from RPC)
 
 ```
-Client → Server:  [frame: type=pipeline_mem,
-  [4B sync_count]
-    for each sync: [8B addr][8B original_size][1B comp_flag][4B data_size][data...]
-  [4B rpc_count]
-    for each rpc: [4B len][rpc_bytes]
-  [4B read_count]
-    for each read: [8B addr][8B size]
-  [handle_manifest: 4B count + N × handle_manifest_entry]
-]
-Server → Client:  [frame: type=pipeline_response,
-  [4B rpc_count]
-    for each rpc: [4B resp_len][resp_bytes]
-  [4B read_count]
-    for each read: [4B data_len][1B comp_flag][data...]
-]
+Client → Server:  [frame: type=memory_op,
+                    payload=[mem_request: op, addr, size][data... for host_sync]]
+Server → Client:  [frame: type=memory_reply,
+                    payload=[mem_response: status, size, addr][data... for host_read]]
 ```
 
 See [wire-protocol.md](wire-protocol.md) for the complete protocol specification.
@@ -306,11 +352,16 @@ A typical CUDA workload goes through these phases:
    handles. No round-trips needed — they're batched.
 
 3. **Data Transfer + Compute (enqueued)** — cuMemcpyHtoD, cuLaunchKernel,
-   cuCtxSynchronize. All batched. Host data is inline-synced in the pipeline_mem
-   frame.
+   cuCtxSynchronize. All batched. Host data for HtoD is synced via the memory
+   layer (host_sync), not packed into RPC frames. The write tracker
+   transparently detects dirty pages in the shadow region; `flush_dirty()`
+   pushes only modified pages to the server.
 
 4. **Readback (flush)** — cuMemcpyDtoH. This triggers the pipeline flush,
-   sending all accumulated calls in one round-trip.
+   sending all accumulated calls in one round-trip. Data comes back via
+   `host_read` on the memory channel. Touching the readback buffer triggers
+   demand paging — each page is fetched from the server's mirror on first
+   access and cached locally for subsequent reads.
 
 5. **Cleanup (enqueued)** — cuMemFree, cuCtxDestroy. Batched and flushed
    with the next explicit flush or at connection close.
@@ -336,30 +387,40 @@ A typical CUDA workload goes through these phases:
 
 - **[r3map](https://github.com/pojntfx/r3map)** — Remote memory region
   mounting library. zlink's memory synchronization subsystem (chunk cache,
-  host memory mirror, shared memory plane) is based on r3map's managed mount
+  host memory mirror, backend interface) is based on r3map's managed mount
   architecture (SyncedReadWriterAt + Puller + Pusher pattern). The research
   paper is at <https://pojntfx.github.io/networked-linux-memsync/main.pdf>.
+
+- **[LZ4](https://github.com/lz4/lz4)** — Fast compression for memory
+  transfers on the bulk channel.
 
 - **C++20** — Required for concepts, `std::span`, designated initializers.
 
 - **POSIX** — For `dlopen`/`dlsym`, `mmap`/`munmap`, TCP sockets.
 
 - **Linux** (optional) — `userfaultfd` for demand paging on shadow regions.
+  When `userfaultfd(2)` is blocked (e.g., by container seccomp profiles),
+  the write tracker transparently falls back to `mprotect` + `SIGSEGV`,
+  which works on any POSIX system.
 
 ## Design Principles
 
 1. **Correctness over performance** — If in doubt, make it a barrier. That's
    always correct. Optimize to enqueued only when you're sure it's safe.
 
-2. **On-demand flushing** — The pipeline flushes only when forced (barrier or
+2. **Separation of RPC and memory** — RPC frames carry only call metadata
+   and virtual handles. Memory data flows independently via the backend
+   interface, so bulk transfers never block RPC traffic.
+
+3. **On-demand flushing** — The pipeline flushes only when forced (barrier or
    readback). No timers, no eager sending. This naturally maximizes batch sizes.
 
-3. **No code generation** — The API surface is declared using C++20 templates
+4. **No code generation** — The API surface is declared using C++20 templates
    and zpp_bits bindings. No IDL, no protoc, no build step.
 
-4. **Virtual handles eliminate barriers** — The biggest performance win comes
+5. **Virtual handles eliminate barriers** — The biggest performance win comes
    from making handle-producing calls non-blocking. VH is the key innovation.
 
-5. **Wire efficiency** — LZ4 compression for large transfers, inline memory
-   ops to avoid extra round-trips, pipeline_mem frames that combine everything
-   into a single network message.
+6. **QUIC-ready transport** — The 3-channel multiplexed transport maps
+   naturally to QUIC streams, enabling future migration from TCP to QUIC
+   without application-level changes.

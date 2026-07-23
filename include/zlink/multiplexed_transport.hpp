@@ -60,7 +60,7 @@ public:
 
     // Automatic routing: inspects frame type and routes to channel
     //   request/response/error → rpc_control
-    //   pipeline_mem/pipeline_request/pipeline_response → bulk_data
+    //   pipeline_request/pipeline_response → bulk_data
     //   memory_op/memory_reply → bulk_data if payload > 16KB, else rpc_control
     //   heartbeat → rpc_control
     std::error_code send(const frame& f) override;

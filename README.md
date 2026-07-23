@@ -7,12 +7,13 @@ zlink combines [zpp_bits](https://github.com/eyalz800/zpp_bits) (C++20 binary se
 ## Key Features
 
 - **Dependency-aware CUDA pipeline** — Batches multiple GPU calls into single network round-trips using virtual handles
-- **Managed pipeline** — Prefetch, write-behind, and multiplexed transport sustain throughput at WAN RTTs (3.2x speedup at 10ms RTT)
 - **Virtual handles** — Break the barrier chain: `cuMemAlloc` returns a virtual ID instead of blocking for the real pointer
-- **Inline memory operations** — Host data sync and device data readback are packed into pipeline frames, zero extra round-trips
+- **Separated memory layer** — Host data syncs via the backend interface (ReadAt/WriteAt/Sync), not packed into RPC frames
+- **Demand paging + write tracking** — Transparent read-side demand paging and write-side dirty tracking on shadow regions, with a three-tier runtime fallback: userfaultfd WP_ASYNC (kernel 6.2+) → userfaultfd WP sync (kernel 4.11+) → mprotect + SIGSEGV (any POSIX system, including containers where seccomp blocks userfaultfd)
+- **Multiplexed transport** — 3 logical channels (RPC/bulk/prefetch), QUIC-ready
 - **Zero codegen** — Explicit API declarations with zpp_bits `bind<>`, no Python scripts or generated stubs
 - **Type-safe** — C++20 templates ensure compile-time type safety for all RPC calls
-- **Workload-agnostic** — Managed pipeline benefits any iterative CUDA workload (ML training, compute, transfer, mixed)
+- **LZ4 compression** — Large memory transfers compressed automatically
 
 ## Architecture
 
@@ -21,15 +22,15 @@ zlink combines [zpp_bits](https://github.com/eyalz800/zpp_bits) (C++20 binary se
   ┌──────────────────────────┐                  ┌──────────────────────────┐
   │ Application code          │                  │ zlink server              │
   │    ↓                      │                  │    ↓                      │
-  │ cuda_pipeline<RpcDef>     │                  │ handle_pipeline_mem()     │
-  │    ↓                      │                  │    ↓                      │
+  │ cuda_pipeline<RpcDef>     │                  │ handle_pipeline_request() │
+  │  (RPC batching + VH)      │                  │    ↓                      │
+  │    ↓                      │  RPC channel     │ zpp_bits dispatch         │
+  │ Transport (multiplexed)   │ ═════════════►   │ Transport (multiplexed)   │
+  │    ↓                      │  ◄═════════════  │    ↓                      │
+  │ write_tracker + chunk_cache│ Bulk channel    │ host_memory_mirror        │
+  │  (demand paging + cache)  │ ═════════════►   │  (server-side mirror)     │
+  │                           │  ◄═════════════  │                           │
   │ Virtual handle allocator  │                  │ Handle table (VH→real)    │
-  │    ↓                      │                  │    ↓                      │
-  │ zpp_bits serialization    │   TCP frames     │ zpp_bits deserialization  │
-  │    ↓                      │ ═════════════►   │    ↓                      │
-  │ Transport (TCP)           │                  │ Real CUDA calls           │
-  │                           │  ◄═════════════  │    ↓                      │
-  │ Host mirror client        │   TCP frames     │ Host memory mirror        │
   └──────────────────────────┘                  └──────────────────────────┘
 ```
 
@@ -81,14 +82,11 @@ Terminal 2 (client):
 |----------|-------------|
 | [architecture.md](docs/architecture.md) | System architecture and component overview |
 | [building.md](docs/building.md) | Build instructions and running examples |
-| [cuda-pipeline.md](docs/cuda-pipeline.md) | Virtual handles and dependency-aware pipelining |
 | [wire-protocol.md](docs/wire-protocol.md) | Frame format and network protocol |
 | [memory.md](docs/memory.md) | Remote memory, host mirror, chunk cache |
 | [pointer-marshalling.md](docs/pointer-marshalling.md) | How pointers cross the network boundary |
-| [compression.md](docs/compression.md) | LZ4 compression in pipeline frames |
+| [compression.md](docs/compression.md) | LZ4 compression for memory transfers |
 | [rpc-framework.md](docs/rpc-framework.md) | zpp_bits RPC engine and API declaration |
-| [managed-pipeline.md](docs/managed-pipeline.md) | Managed pipeline architecture (prefetch, write-behind, multiplexed transport) |
-| [managed-pipeline-integration.md](docs/managed-pipeline-integration.md) | Step-by-step integration guide for managed pipeline |
 | [pytorch-over-zlink.md](docs/pytorch-over-zlink.md) | Planned PyTorch integration via LD_PRELOAD shim |
 
 ## Pipeline Performance
@@ -111,6 +109,8 @@ cuMemcpyDtoH(out, VH(2))   → readback: flush!    ┘
 Total: 3 barrier RTs + 1 pipeline batch RT = 4 round-trips
 ```
 
+Memory data for `cuMemcpyHtoD` flows on the bulk channel, independent of RPC traffic.
+
 ## Wire Protocol
 
 Each frame on the wire:
@@ -122,8 +122,9 @@ Each frame on the wire:
 └──────────────┴──────────────┴───────────┴──────────────────┘
 ```
 
-The `pipeline_mem` frame type (`0x06`) combines host sync data, RPC calls,
-read requests, and the virtual handle manifest into a single round-trip.
+The `pipeline_request` frame type (`0x04`) batches multiple RPC calls and
+includes the virtual handle manifest. Memory data flows via separate
+`memory_op` frames on the bulk channel.
 
 See [wire-protocol.md](docs/wire-protocol.md) for full protocol details.
 
@@ -132,23 +133,20 @@ See [wire-protocol.md](docs/wire-protocol.md) for full protocol details.
 ```
 zlink/
 ├── include/zlink/          # Public headers (mostly header-only)
-│   ├── config.hpp          # Protocol constants, frame types (incl. managed pipeline)
+│   ├── config.hpp          # Protocol constants, frame types
 │   ├── transport.hpp       # Abstract transport + frame struct
 │   ├── tcp_transport.hpp   # TCP transport implementation
-│   ├── multiplexed_transport.hpp # 3-channel TCP (RPC/bulk/prefetch) — managed pipeline
+│   ├── multiplexed_transport.hpp # 3-channel TCP (RPC/bulk/prefetch)
 │   ├── rpc.hpp             # RPC engine (client, pipeline, server)
-│   ├── cuda_pipeline.hpp   # Dependency-aware CUDA pipeline
-│   ├── managed_pipeline.hpp # Managed pipeline wrapper (prefetch + write-behind)
+│   ├── cuda_pipeline.hpp   # Dependency-aware CUDA RPC pipeline
 │   ├── virtual_handle.hpp  # Virtual handle system
 │   ├── cuda_dep_spec.hpp   # CUDA API dependency categorization
 │   ├── memory.hpp          # Remote memory subsystem
 │   ├── chunk_cache.hpp     # Page-level cache (r3map-inspired)
-│   ├── prefetch_worker.hpp # Background page prefetch with pattern detection
-│   ├── write_behind_buffer.hpp # Async write-behind with fence sync
-│   ├── connection_manager.hpp # Auto-reconnect + heartbeat + session recovery
-│   ├── shared_mem.hpp      # Shared memory plane
+│   ├── write_tracker.hpp   # Write tracking: uffd WP / mprotect+SIGSEGV
+│   ├── shared_mem.hpp      # Backend interface (ReadAt/WriteAt/Size/Sync)
 │   ├── ptr_map.hpp         # Bidirectional pointer mapping
-│   ├── compress.hpp        # LZ4 compression for large payloads
+│   ├── compress.hpp        # LZ4 compression for memory transfers
 │   ├── shim.hpp            # LD_PRELOAD shim
 │   ├── client.hpp          # Client framework
 │   └── server.hpp          # Server framework
@@ -157,12 +155,11 @@ zlink/
 │   ├── libmath/            # Remote math example
 │   └── cuda/               # CUDA RPC server + pipeline client
 │       ├── cuda_api.hpp    # Hand-written CUDA Driver API RPC declarations
-│       ├── cuda_server.cpp # GPU server: real CUDA calls + pipeline_mem handler
+│       ├── cuda_server.cpp # GPU server: real CUDA calls + pipeline handler
 │       ├── cuda_client.cpp # Pipeline client: virtual handles + readback test
 │       └── CMakeLists.txt  # Builds cuda_server (needs CUDA) + cuda_client
 ├── tests/                  # Unit tests
 ├── docs/                   # Documentation
-├── sim/                    # Performance simulation + charts
 └── cmake/                  # CMake modules (zpp_bits fetch)
 ```
 
@@ -170,7 +167,7 @@ zlink/
 
 | Project | Approach | Codegen | Generic | Pipelining | Memory | Transport |
 |---------|----------|---------|---------|------------|--------|-----------|
-| **zlink** | RPC pipeline + managed mount | No | Yes | Virtual handles + prefetch + write-behind | Inline sync + demand paging + cache | TCP (3-channel) |
+| **zlink** | RPC pipeline + backend interface | No | Yes | Virtual handles + batched RPC | Separated memory layer + cache | TCP (3-channel, QUIC-ready) |
 | **Lupine** | CUDA shim | Yes (Python) | No (CUDA only) | Basic | Handle remap | HTTP/2 |
 | **RCUDA** | CUDA RPC | Yes | No | Basic | Basic | TCP |
 | **SCUDA** | CUDA bridge | Yes (Python) | No | Basic | Basic | TCP |

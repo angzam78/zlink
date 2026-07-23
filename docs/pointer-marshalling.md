@@ -31,79 +31,84 @@ Lupine's approach:
 
 Same fundamental approach as Lupine with the same limitations.
 
-## zlink's Current Approach: Inline Host Sync in Pipeline Frames
+## zlink's Approach: Separated Memory Layer
 
-zlink currently handles pointer marshalling by packing host data inline into
-`pipeline_mem` frames. This is a simpler and more performant approach than
-on-demand fetching for the CUDA use case.
+zlink separates pointer marshalling into two independent mechanisms:
 
-### How It Works Today
+1. **Device pointers** → Virtual handles (encoded in the pointer value itself)
+2. **Host pointers** → Memory layer (host_sync / host_read via the backend interface)
 
-Instead of making the server fetch client data on demand (which requires
-extra round-trips), zlink packs the host data directly into the pipeline
-frame alongside the RPC calls:
+RPC frames carry only call metadata and virtual handle IDs. Host buffer data
+flows on a separate channel, never blocking RPC traffic.
+
+### Device Pointers: Virtual Handles
+
+Device pointers are replaced with client-side virtual IDs:
+
+- `cuMemAlloc` returns a virtual handle (VH) instead of a real device pointer
+- Subsequent calls pass VH values as arguments
+- The server translates VH → real handle via `handle_table::translate()`
+- The encoding is safe: bit 63 is set for virtual handles, which never
+  appears in real user-space pointers
+
+```
+VH(0) = 0x8000000000000000
+VH(1) = 0x8000000000000001
+Real ptr: 0x7f18c6c00000 (bit 63 clear)
+```
+
+See [architecture.md](architecture.md) § Virtual Handle System for details.
+
+### Host Pointers: Memory Layer
+
+Host buffer data is synced via the memory layer, not packed into RPC frames.
 
 ```
 CLIENT                                            SERVER
 ┌────────────────────────┐                        ┌────────────────────────┐
-│ cuMemcpyHtoD(VH(1),    │                        │ Receives pipeline_mem   │
-│   host_data, 256)      │                        │ frame:                 │
+│ cuMemcpyHtoD(VH(1),    │                        │ Receives:               │
+│   host_data, 256)      │                        │  1. memory_op (sync)   │
+│                        │                        │  2. pipeline_request   │
+│ Step 1: host_sync      │                        │                        │
+│   Sends host_data to   │  memory_op frame       │  sync_page() stores    │
+│   server mirror        │ ══════════════════►    │  data in mirror region │
 │                        │                        │                        │
-│ enqueue_with_sync<9>(  │                        │ 1. Apply sync entries  │
-│   host_ptr, 256,       │                        │    → write to mirror   │
-│   VH(1), addr, 256)    │                        │    → client addr now   │
-│                        │                        │      has server data   │
-│ Pipeline batches:      │                        │                        │
-│  sync: [addr=0x7fff,   │  pipeline_mem frame    │ 2. Process RPC calls   │
-│         size=256,      │ ══════════════════►    │    translate VH→real   │
-│         data=...]      │                        │    translate client    │
-│  rpc:  [cuMemcpyHtoD  │                        │      ptr→server ptr    │
-│         (VH(1),       │                        │    call real cuMemcpy-  │
-│          0x7fff, 256)] │                        │      HtoD()            │
-│  manifest: [VH(1)←call0]│                       │                        │
+│ Step 2: enqueue RPC    │                        │  translate VH→real     │
+│   memcpy_hto_d(VH(1),  │  pipeline_request      │  translate client addr │
+│   client_addr, 256)    │ ══════════════════►    │    → server-local addr │
+│                        │                        │  call cuMemcpyHtoD()   │
 └────────────────────────┘                        └────────────────────────┘
 ```
 
-### Step-by-Step: cuMemcpyHtoD with Inline Sync
+### Step-by-Step: cuMemcpyHtoD
 
 1. **Client** calls `cu_memcpy_htod(pipe, dev_vh, host_data, byte_count)`
-2. This calls `pipe.enqueue_with_sync<9>(host_data, byte_count, dev_vh, client_addr, byte_count)`
-3. The pipeline:
-   - Queues a `pending_sync` with the host data copied from `host_data`
-   - Queues the RPC call `memcpy_htod(dev_vh, client_addr, byte_count)`
-4. When the pipeline flushes (at the next readback or explicit flush):
-   - Builds a `pipeline_mem` frame with sync entries, RPC calls, and handle
-     manifest
-   - Sends it in a single network round-trip
-5. **Server** receives the frame:
-   - Processes sync entries: `g_host_mirror.sync_page(client_addr, data)`
-     → stores data in server's mmap'd mirror region
-   - Processes RPC calls:
-     - Translates `dev_vh` → real device pointer via `g_vhandles.translate()`
-     - Translates `client_addr` → server-local address via `g_host_mirror.translate()`
-     - Calls real `cuMemcpyHtoD(real_dev_ptr, server_local_ptr, byte_count)`
+2. This enqueues the RPC call: `pipe.enqueue<memcpy_hto_d>(dev_vh, client_addr, byte_count)`
+3. Before the RPC batch is sent, the client syncs host data via the memory
+   layer (`host_sync` frame on the memory channel)
+4. **Server** receives the `host_sync`:
+   - `g_host_mirror.sync_page(client_addr, data)` stores data in server's
+     mmap'd mirror region
+5. **Server** receives the `pipeline_request`:
+   - Translates `dev_vh` → real device pointer via `g_vhandles.translate()`
+   - Translates `client_addr` → server-local address via `g_host_mirror.translate()`
+   - Calls real `cuMemcpyHtoD(real_dev_ptr, server_local_ptr, byte_count)`
 6. CUDA reads from the server-local pointer, which has the same data as
    the client's original buffer
 
-### Step-by-Step: cuMemcpyDtoH with Inline Read
+### Step-by-Step: cuMemcpyDtoH (Readback)
 
 1. **Client** calls `cu_memcpy_dtoh(pipe, host_data, dev_vh, byte_count)`
-2. This calls `pipe.call_readback_with_sync_read<10>(host_data, byte_count, client_addr, dev_vh, byte_count)`
-3. The pipeline:
-   - Queues a `pending_sync` (zero-fill, to create the mirror region)
-   - Queues a `pending_read` (requesting the data back after execution)
-   - Queues the RPC call
-   - Immediately flushes (readback forces flush)
-4. **Server** receives the frame:
-   - Processes sync entries (creates mirror region)
-   - Processes RPC call:
-     - Translates VH and client address
-     - Calls real `cuMemcpyDtoH(server_local_ptr, real_dev_ptr, byte_count)`
-     - GPU data is now in the server's mirror region
-   - Processes read requests: reads data from mirror region
-5. **Server** sends response with RPC results + read data
-6. **Client** parses response: read data is automatically copied to
-   `host_data` buffer
+2. This calls `pipe.call_readback<memcpy_dto_h>(client_addr, dev_vh, byte_count)`
+   which flushes any pending batch, then sends the RPC synchronously
+3. **Server** processes the RPC:
+   - Translates VH and client address
+   - Calls real `cuMemcpyDtoH(server_local_ptr, real_dev_ptr, byte_count)`
+   - GPU data is now in the server's mirror region
+4. **Client** calls `pipe.host_read(host_data, byte_count)`:
+   - Sends a `host_read` memory_op frame
+   - Server reads from the mirror region and sends data back
+   - Client copies data into `host_data` buffer
 
 ### The host_memory_mirror Class
 
@@ -147,29 +152,15 @@ This means the client doesn't need to explicitly register regions before
 syncing — the first `host_sync` for an address range automatically creates
 the mirror.
 
-## Virtual Handles for Device Pointers
-
-Device pointers are handled differently from host pointers. They use the
-virtual handle system (see [cuda-pipeline.md](cuda-pipeline.md) for full
-details):
-
-- `cuMemAlloc` returns a virtual handle (VH) instead of a real device
-  pointer
-- Subsequent calls pass VH values as arguments
-- The server translates VH → real handle via `handle_table::translate()`
-- The encoding is safe: bit 63 is set for virtual handles, which never
-  appears in real user-space pointers
-
 ## Kernel Launch: Deep Pointer Handling
 
 `cuLaunchKernel` is the hardest case because `kernelParams` is an array of
-`void*` pointers, each of which may point to device memory. In the current
-implementation (as seen in `cuda_test_server.cpp`):
+`void*` pointers, each of which may point to device memory. The server-side
+handler walks the args array, translating any virtual handles:
 
 ```cpp
 // Server-side kernel launch handler:
 case 13: {  // launch_kernel
-    // ...
     // Translate the function handle
     real_func = (CUfunction)g_vhandles.translate(func_vh);
 
@@ -192,49 +183,35 @@ case 13: {  // launch_kernel
 }
 ```
 
-This approach walks the kernel args array on the server side, translating
-any virtual handles found in the argument slots. It works because:
-
-1. The client sends the args data via `host_sync` (inline in pipeline_mem)
+This approach works because:
+1. The client syncs the args data via `host_sync` (memory channel)
 2. The server mirrors the data at a known server-local address
 3. The server walks the args, translating VH values to real device pointers
 4. CUDA receives real pointers and the kernel runs correctly
 
-## Comparison: Current vs Planned
-
-| Aspect | Current (inline sync) | Planned (on-demand) |
-|--------|----------------------|---------------------|
-| Input pointers | Inline in pipeline_mem frame | Auto-fetch via ReadAt |
-| Output pointers | Inline read in pipeline_mem response | Auto-writeback via WriteAt |
-| Extra round-trips | None (data is inline) | 1 RTT per on-demand fetch |
-| Code complexity | Simple (pack/unpack) | Complex (caching, coherence) |
-| Best for | LAN, moderate data sizes | WAN, sparse access patterns |
-| Implemented | Yes | Partially (framework exists) |
-
-The inline approach is currently used because it gives the best performance
-for the common CUDA workload pattern (batch HtoD → compute → DtoH) with
-zero extra round-trips. The on-demand approach via `shared_mem_plane` and
-`chunk_cache` is implemented as a framework but not yet the default path
-for CUDA operations.
-
-## Future: On-Demand Access via Shared Memory Plane
+## Backend Interface
 
 The `shared_mem_plane` (in `shared_mem.hpp`) and `chunk_cache` (in
-`chunk_cache.hpp`) provide the infrastructure for on-demand access:
+`chunk_cache.hpp`) provide the infrastructure for on-demand memory access
+via the r3map Backend interface:
 
 1. **`backend` interface** — `ReadAt/WriteAt/Size/Sync`, matching r3map's Go
    Backend
 2. **`memory_backend`** — Wraps local memory as a backend
-3. **`rpc_backend`** — Proxies ReadAt/WriteAt over the RPC transport
+3. **`rpc_backend`** — Proxies ReadAt/WriteAt over the transport
 4. **`shared_mem_plane`** — Coordinates client↔server memory access with
    lazy fetching and background push/pull
 
-When enabled, the server would fetch client data on-demand rather than
-requiring it to be pre-synced. This is beneficial for:
+This enables future enhancements:
+- Demand paging via `userfaultfd` (read-side)
+- Write tracking via `mprotect` + `SIGSEGV` (write-side)
+- Page-level caching with coherence (chunk_cache)
 
-- WAN deployments where pre-syncing large buffers is expensive
-- Sparse access patterns where only a few pages are actually needed
-- Workloads with repeated access to the same pages (caching benefit)
+## Summary
 
-The framework is in place; what remains is integrating it as an alternative
-to the inline sync path for CUDA operations.
+| Pointer type | Mechanism | Channel |
+|-------------|-----------|---------|
+| Device pointers | Virtual handles (bit 63 encoding) | RPC (in call args) |
+| Host input pointers | `host_sync` to server mirror | Memory channel |
+| Host output pointers | `host_read` from server mirror | Memory channel |
+| Kernel args (deep pointers) | `host_sync` + server-side VH walk | Memory + RPC |

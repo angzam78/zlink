@@ -45,7 +45,9 @@ Payload: [zpp_bits serialized: return value]
 
 ### 0x04 — Pipeline Request
 
-Multiple RPC calls batched into one frame. Each call is length-prefixed.
+Multiple RPC calls batched into one frame, plus a handle manifest. Each call
+is length-prefixed. The handle manifest at the end tells the server which
+calls produce virtual handles.
 
 ```
 Payload:
@@ -53,7 +55,21 @@ Payload:
   For each call:
     [4B request_len]
     [request_len bytes: zpp_bits serialized request]
+  [handle_manifest: 4B entry_count + N × handle_manifest_entry]
 ```
+
+Handle manifest entry format (16 bytes each):
+```
+  [4B call_index]   (0-indexed position in the call list)
+  [4B virtual_id]   (virtual handle ID to assign)
+  [4B return_field] (which field in return struct is the handle)
+  [4B reserved]     (alignment padding)
+```
+
+The server processes this frame by:
+1. Parsing the handle manifest (at the end of the payload)
+2. Processing RPC calls in order, registering handles after each
+   handle-producing call using the manifest mapping
 
 ### 0x05 — Pipeline Response
 
@@ -65,64 +81,6 @@ Payload:
   For each response:
     [4B response_len]
     [response_len bytes: zpp_bits serialized response]
-```
-
-### 0x06 — Pipeline Memory (pipeline_mem)
-
-Combined frame for inline memory operations + RPC calls + read requests.
-This is the key frame type for the CUDA pipeline: it packs host_sync data,
-RPC calls, read requests, and the handle manifest into a single round-trip.
-
-```
-Payload:
-  ┌─ Sync section ──────────────────────────────────────────────┐
-  │ [4B sync_count]                                             │
-  │ For each sync:                                              │
-  │   [8B client_addr]  (host memory address on client)        │
-  │   [8B size]         (bytes of data)                         │
-  │   [size bytes: data]                                        │
-  ├─ RPC section ───────────────────────────────────────────────┤
-  │ [4B rpc_count]                                              │
-  │ For each rpc:                                               │
-  │   [4B request_len]                                          │
-  │   [request_len bytes: zpp_bits serialized request]          │
-  ├─ Read section ──────────────────────────────────────────────┤
-  │ [4B read_count]                                             │
-  │ For each read:                                              │
-  │   [8B client_addr]  (host buffer address on client)        │
-  │   [8B size]         (bytes to read back)                    │
-  ├─ Handle manifest ───────────────────────────────────────────┤
-  │ [4B entry_count]                                            │
-  │ For each entry:                                             │
-  │   [4B call_index]   (0-indexed position in RPC section)    │
-  │   [4B virtual_id]   (virtual handle ID to assign)          │
-  │   [4B return_field] (which field in return struct is handle)│
-  │   [4B reserved]     (alignment padding)                     │
-  └─────────────────────────────────────────────────────────────┘
-```
-
-The server processes this frame in order:
-1. Apply all sync entries (write host data to mirror regions)
-2. Process RPC calls sequentially, registering handles after each
-   handle-producing call
-3. After all RPC calls, read mirror data for each read request
-4. Pack everything into a pipeline_response frame
-
-The response format:
-
-```
-Payload:
-  ┌─ RPC results ───────────────────────────────────────────────┐
-  │ [4B rpc_count]                                              │
-  │ For each rpc:                                               │
-  │   [4B response_len]                                         │
-  │   [response_len bytes: zpp_bits serialized response]        │
-  ├─ Read data ─────────────────────────────────────────────────┤
-  │ [4B read_count]                                             │
-  │ For each read:                                              │
-  │   [4B data_len]                                             │
-  │   [data_len bytes: mirror data from server]                 │
-  └─────────────────────────────────────────────────────────────┘
 ```
 
 ### 0x10 — Memory Operation

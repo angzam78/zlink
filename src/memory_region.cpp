@@ -9,6 +9,7 @@
 #include <zlink/rpc.hpp>
 #include <zlink/config.hpp>
 #include <zlink/chunk_cache.hpp>
+#include <zlink/write_tracker.hpp>
 
 #include <cstring>
 #include <cstdlib>
@@ -37,61 +38,90 @@ class cached_memory_client::rpc_remote_backend : public remote_backend {
 public:
     explicit rpc_remote_backend(rpc_client_base* rpc) : rpc_(rpc) {}
 
+    // Set the base address used to translate offsets → absolute addresses
+    // for server communication. The server's host_memory_mirror uses
+    // absolute client addresses.
+    void set_base(std::uintptr_t base) { base_ = base; }
+
     std::error_code read_at(std::uintptr_t offset,
                              std::span<std::byte> buf) override {
-        // Send a memory read RPC and get the data back
+        // Send a host_read memory_op frame and get the data back.
+        // The server's handle_memory_op() reads from its host_memory_mirror.
+        // Translate offset → absolute address for server lookup.
         mem_request req;
-        req.op = mem_op::read;
-        req.remote_addr = offset;
+        req.op = mem_op::host_read;
+        req.remote_addr = offset + base_;
         req.size = buf.size();
 
         std::vector<std::byte> req_data(sizeof(mem_request));
         std::memcpy(req_data.data(), &req, sizeof(mem_request));
 
-        std::vector<std::byte> resp_data;
-        auto ec = rpc_->send_request(req_data, resp_data);
+        frame read_frame;
+        read_frame.call_id = 0;
+        read_frame.type = frame_type::memory_op;
+        read_frame.payload = req_data;
+
+        auto& tp = rpc_->get_transport();
+        auto ec = tp.send(read_frame);
         if (ec) return ec;
 
-        if (resp_data.size() < sizeof(mem_response)) {
+        frame resp_frame;
+        ec = tp.receive(resp_frame);
+        if (ec) return ec;
+
+        if (resp_frame.payload.size() < sizeof(mem_response)) {
             return std::make_error_code(std::errc::invalid_argument);
         }
 
         mem_response resp;
-        std::memcpy(&resp, resp_data.data(), sizeof(mem_response));
+        std::memcpy(&resp, resp_frame.payload.data(), sizeof(mem_response));
 
         if (failed(resp.status)) {
             return std::make_error_code(std::errc::io_error);
         }
 
         std::size_t data_offset = sizeof(mem_response);
-        std::size_t data_size = resp_data.size() - data_offset;
+        std::size_t data_size = resp_frame.payload.size() - data_offset;
         if (data_size > buf.size()) data_size = buf.size();
-        std::memcpy(buf.data(), resp_data.data() + data_offset, data_size);
+        std::memcpy(buf.data(), resp_frame.payload.data() + data_offset, data_size);
 
         return {};
     }
 
     std::error_code write_at(std::uintptr_t offset,
                               std::span<const std::byte> data) override {
+        // Send as a host_sync memory_op frame (not an RPC request).
+        // The server's handle_memory_op() stores the data in its
+        // host_memory_mirror. Translate offset → absolute address.
         mem_request req;
-        req.op = mem_op::write;
-        req.remote_addr = offset;
+        req.op = mem_op::host_sync;
+        req.remote_addr = offset + base_;
         req.size = data.size();
 
-        std::vector<std::byte> req_data(sizeof(mem_request) + data.size());
-        std::memcpy(req_data.data(), &req, sizeof(mem_request));
-        std::memcpy(req_data.data() + sizeof(mem_request), data.data(), data.size());
+        std::vector<std::byte> payload(sizeof(mem_request) + data.size());
+        std::memcpy(payload.data(), &req, sizeof(mem_request));
+        std::memcpy(payload.data() + sizeof(mem_request), data.data(), data.size());
 
-        std::vector<std::byte> resp_data;
-        auto ec = rpc_->send_request(req_data, resp_data);
+        frame sync_frame;
+        sync_frame.call_id = 0;
+        sync_frame.type = frame_type::memory_op;
+        sync_frame.payload = std::move(payload);
+
+        auto& tp = rpc_->get_transport();
+        auto ec = tp.send(sync_frame);
         if (ec) return ec;
 
-        if (resp_data.size() < sizeof(mem_response)) {
+        // Wait for the ack
+        frame resp_frame;
+        ec = tp.receive(resp_frame);
+        if (ec) return ec;
+
+        if (resp_frame.payload.size() < sizeof(mem_response)) {
             return std::make_error_code(std::errc::invalid_argument);
         }
 
         mem_response resp;
-        std::memcpy(&resp, resp_data.data(), sizeof(mem_response));
+        std::memcpy(&resp, resp_frame.payload.data(), sizeof(mem_response));
         if (failed(resp.status)) {
             return std::make_error_code(std::errc::io_error);
         }
@@ -106,6 +136,7 @@ public:
 private:
     rpc_client_base* rpc_;
     std::size_t region_size_ = 0;
+    std::uintptr_t base_ = 0;  // shadow region base for offset→absolute translation
 };
 
 // ══════════════════════════════════════════════════════════════════════
@@ -113,14 +144,16 @@ private:
 // ══════════════════════════════════════════════════════════════════════
 struct cached_memory_client::impl {
     rpc_client_base* rpc = nullptr;
+    std::uintptr_t shadow_base = 0;  // base of the shadow region for addr↔offset translation
 
 #if ZLINK_HAS_USERFAULTFD
-    int uffd = -1;
+    int uffd = -1;  // kept for compatibility; actual uffd is inside wtracker
     std::uintptr_t demand_base = 0;
     std::size_t demand_size = 0;
-    std::thread fault_thread;
     std::atomic<bool> demand_paging_enabled{false};
 #endif
+
+    std::unique_ptr<write_tracker> wtracker;
 };
 
 cached_memory_client::cached_memory_client(class rpc_client_base& rpc,
@@ -157,14 +190,16 @@ cached_memory_client::~cached_memory_client() {
 
 std::error_code cached_memory_client::read(std::uintptr_t remote_addr,
                                             std::span<std::byte> local_buf) {
-    // Go through the chunk cache — if page is cached, no network!
-    return cache_->read(remote_addr, local_buf);
+    // Translate absolute address → offset for chunk_cache/local_store
+    std::uintptr_t offset = remote_addr - impl_->shadow_base;
+    return cache_->read(offset, local_buf);
 }
 
 std::error_code cached_memory_client::write(std::uintptr_t remote_addr,
                                              std::span<const std::byte> local_buf) {
-    // Write through the cache — marks pages dirty, pusher syncs later
-    return cache_->write(remote_addr, local_buf);
+    // Translate absolute address → offset for chunk_cache/local_store
+    std::uintptr_t offset = remote_addr - impl_->shadow_base;
+    return cache_->write(offset, local_buf);
 }
 
 std::error_code cached_memory_client::alloc(std::size_t size, std::uintptr_t& out_addr) {
@@ -214,7 +249,25 @@ std::error_code cached_memory_client::free(std::uintptr_t remote_addr) {
 }
 
 std::size_t cached_memory_client::flush_dirty() {
-    return cache_->sync_dirty();
+    // 1. Collect dirty pages from the write_tracker (uffd WP or mprotect SIGSEGV)
+    //    and write them into the chunk_cache's local store.
+    //    The write_tracker reports absolute addresses; translate to offsets.
+    std::size_t pushed = 0;
+    if (impl_->wtracker) {
+        auto dirty = impl_->wtracker->collect_dirty();
+        for (const auto& r : dirty) {
+            std::uintptr_t offset = r.addr - impl_->shadow_base;
+            cache_->write(offset, std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(r.addr), r.len));
+            ++pushed;
+        }
+    }
+
+    // 2. Push ALL dirty pages (from write_tracker above + any explicit writes)
+    //    to the server via the remote backend.
+    pushed += cache_->sync_dirty();
+
+    return pushed;
 }
 
 void cached_memory_client::invalidate(std::span<const std::int64_t> page_offsets) {
@@ -242,83 +295,50 @@ void cached_memory_client::stop_background() {
 #if ZLINK_HAS_USERFAULTFD
 std::error_code cached_memory_client::enable_demand_paging(std::uintptr_t base,
                                                             std::size_t size) {
-    impl_->uffd = static_cast<int>(syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK));
-    if (impl_->uffd < 0) {
-        return std::make_error_code(std::errc::invalid_argument);
-    }
+    // Store the shadow region base for address translation.
+    impl_->shadow_base = base;
+    rpc_backend_->set_base(base);
 
-    struct uffdio_api api{};
-    api.api = UFFD_API;
-    api.features = UFFD_FEATURE_PAGEFAULT_FLAG_WP;
-    if (ioctl(impl_->uffd, UFFDIO_API, &api) < 0) {
-        ::close(impl_->uffd);
-        impl_->uffd = -1;
-        return std::make_error_code(std::errc::invalid_argument);
-    }
-
-    struct uffdio_register reg{};
-    reg.range.start = base;
-    reg.range.len = size;
-    reg.mode = UFFDIO_REGISTER_MODE_MISSING;
-    if (ioctl(impl_->uffd, UFFDIO_REGISTER, &reg) < 0) {
-        ::close(impl_->uffd);
-        impl_->uffd = -1;
-        return std::make_error_code(std::errc::invalid_argument);
-    }
+    // The write_tracker is the SINGLE uffd/mprotect handler for this region.
+    // It handles:
+    //   MISSING/read faults  → calls read_fault_cb → fetches via chunk_cache
+    //                          → UFFDIO_COPY or mprotect+memcpy (done inside tracker)
+    //   WP/write faults      → marks page dirty in internal bitmap
+    //
+    // flush_dirty() later calls wtracker->collect_dirty() to get dirty ranges
+    // and pushes them to the server.
+    const std::size_t ps = cache_->chunk_size();
 
     impl_->demand_base = base;
     impl_->demand_size = size;
     impl_->demand_paging_enabled.store(true);
 
-    // Fault handler thread — resolves faults through the chunk cache
-    impl_->fault_thread = std::thread([this]() {
-        while (impl_->demand_paging_enabled.load()) {
-            struct pollfd pfd{};
-            pfd.fd = impl_->uffd;
-            pfd.events = POLLIN;
+    // Read-fault callback: fetch page from remote via chunk_cache.
+    // The write_tracker does the UFFDIO_COPY / mprotect+memcpy itself.
+    // Translate the absolute fault address → offset for chunk_cache.
+    auto read_cb = [this, base, ps](std::uintptr_t fault_addr, std::size_t /*len*/)
+        -> std::vector<std::byte>
+    {
+        std::uintptr_t offset = fault_addr - base;
+        std::vector<std::byte> page_data(ps);
+        auto ec = cache_->read(offset, page_data);
+        if (ec) return {};
+        return page_data;
+    };
 
-            int n = poll(&pfd, 1, 100);
-            if (n <= 0) continue;
+    impl_->wtracker = write_tracker::create(base, size, std::move(read_cb));
 
-            struct uffd_msg msg{};
-            if (::read(impl_->uffd, &msg, sizeof(msg)) != sizeof(msg)) continue;
-
-            if (msg.event != UFFD_EVENT_PAGEFAULT) continue;
-
-            std::uintptr_t fault_addr = msg.arg.pagefault.address;
-            std::size_t page_size = cache_->chunk_size();
-            std::uintptr_t page_base = fault_addr & ~(page_size - 1);
-
-            // ── THE KEY DIFFERENCE ──
-            // Read through the chunk cache. If this page was previously
-            // fetched, it's already in the local store — NO network!
-            // Only the first fault for each page hits the remote.
-            std::vector<std::byte> page_data(page_size);
-            auto ec = cache_->read(page_base, page_data);
-            if (ec) continue;
-
-            // Resolve the page fault
-            struct uffdio_copy copy{};
-            copy.dst = page_base;
-            copy.src = reinterpret_cast<std::uintptr_t>(page_data.data());
-            copy.len = page_size;
-            copy.mode = 0;
-            ioctl(impl_->uffd, UFFDIO_COPY, &copy);
-        }
-    });
+    if (!impl_->wtracker) {
+        impl_->demand_paging_enabled.store(false);
+        return std::make_error_code(std::errc::not_supported);
+    }
 
     return {};
 }
 
 void cached_memory_client::disable_demand_paging() {
     impl_->demand_paging_enabled.store(false);
-    if (impl_->fault_thread.joinable()) {
-        impl_->fault_thread.join();
-    }
-    if (impl_->uffd >= 0) {
-        ::close(impl_->uffd);
-        impl_->uffd = -1;
-    }
+    impl_->wtracker.reset();
 }
 #endif // ZLINK_HAS_USERFAULTFD
 
@@ -467,108 +487,6 @@ bool host_memory_mirror::is_registered(std::uintptr_t client_addr) const {
         }
     }
     return false;
-}
-
-// ══════════════════════════════════════════════════════════════════════
-//  memory_server implementation
-// ══════════════════════════════════════════════════════════════════════
-struct memory_server::impl {
-    memory_server::read_fn  read_handler;
-    memory_server::write_fn write_handler;
-    memory_server::alloc_fn alloc_handler;
-    memory_server::free_fn  free_handler;
-};
-
-memory_server::memory_server() : impl_(std::make_unique<impl>()) {}
-memory_server::~memory_server() = default;
-
-void memory_server::set_read_handler(read_fn h)  { impl_->read_handler = std::move(h); }
-void memory_server::set_write_handler(write_fn h) { impl_->write_handler = std::move(h); }
-void memory_server::set_alloc_handler(alloc_fn h) { impl_->alloc_handler = std::move(h); }
-void memory_server::set_free_handler(free_fn h)   { impl_->free_handler = std::move(h); }
-
-mem_response memory_server::handle_request(const mem_request& req,
-                                            std::span<const std::byte> write_data,
-                                            std::vector<std::byte>& read_data) {
-    mem_response resp{};
-    resp.status = error_code::ok;
-    resp.remote_addr = req.remote_addr;
-    resp.size = 0;
-
-    switch (req.op) {
-        case mem_op::read: {
-            if (!impl_->read_handler) {
-                resp.status = error_code::server_error;
-                break;
-            }
-            read_data.resize(req.size);
-            auto ec = impl_->read_handler(req.remote_addr, read_data);
-            if (ec) {
-                resp.status = error_code::server_error;
-            } else {
-                resp.size = req.size;
-            }
-            break;
-        }
-
-        case mem_op::write: {
-            if (!impl_->write_handler) {
-                resp.status = error_code::server_error;
-                break;
-            }
-            auto ec = impl_->write_handler(req.remote_addr, write_data);
-            if (ec) {
-                resp.status = error_code::server_error;
-            } else {
-                resp.size = write_data.size();
-            }
-            break;
-        }
-
-        case mem_op::alloc: {
-            if (!impl_->alloc_handler) {
-                resp.status = error_code::server_error;
-                break;
-            }
-            auto ec = impl_->alloc_handler(req.size, resp.remote_addr);
-            if (ec) {
-                resp.status = error_code::server_error;
-            } else {
-                resp.size = req.size;
-            }
-            break;
-        }
-
-        case mem_op::free_op: {
-            if (!impl_->free_handler) {
-                resp.status = error_code::server_error;
-                break;
-            }
-            auto ec = impl_->free_handler(req.remote_addr);
-            if (ec) {
-                resp.status = error_code::server_error;
-            }
-            break;
-        }
-
-        case mem_op::sync: {
-            // Flush any pending writes
-            resp.status = error_code::ok;
-            resp.size = 0;
-            break;
-        }
-
-        default:
-            resp.status = error_code::server_error;
-            break;
-    }
-
-    return resp;
-}
-
-std::error_code memory_server::handle_host_sync(std::uintptr_t client_addr,
-                                                  std::span<const std::byte> data) {
-    return host_mirror_.sync_page(client_addr, data);
 }
 
 } // namespace zlink

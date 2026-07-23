@@ -1,7 +1,7 @@
 #pragma once
-// zlink/compress.hpp — LZ4 compression for pipeline_mem data transfers
+// zlink/compress.hpp — LZ4 compression for memory data transfers
 //
-// Compresses large sync/read data in pipeline_mem frames to reduce
+// Compresses large page-sync data on the bulk channel to reduce
 // network transfer time, especially on bandwidth-limited links.
 //
 // Design:
@@ -10,14 +10,6 @@
 //   - Ratio check: only use compressed version if >10% smaller
 //   - Uses LZ4 (fast compression, ~3-4 GB/s compress, ~4-7 GB/s decompress)
 //   - Zero overhead for small entries or incompressible data
-//
-// Wire format change (sync entries):
-//   Before: [8B addr][8B size][data...]
-//   After:  [8B addr][8B original_size][1B comp_flag][data...]
-//     comp_flag: 0 = raw data, 1 = LZ4 compressed
-//     When compressed, data is LZ4-compressed bytes; original_size is the
-//     uncompressed size (needed for decompression).
-//     When raw, data is original bytes; original_size == data.length().
 //
 // Wire format change (read response entries):
 //   Before: [4B len][data...]
@@ -137,13 +129,8 @@ inline std::vector<std::byte> decompress(
     return output;
 }
 
-// ── Convenience: compress a pending_sync's data ──────────────────────
+// ── Convenience: compress a page-sync payload ────────────────────────
 inline compress_result compress_sync_data(const std::vector<std::byte>& data) {
-    return compress(std::span<const std::byte>(data.data(), data.size()));
-}
-
-// ── Convenience: compress a pending_read's data ──────────────────────
-inline compress_result compress_read_data(const std::vector<std::byte>& data) {
     return compress(std::span<const std::byte>(data.data(), data.size()));
 }
 

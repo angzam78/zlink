@@ -82,6 +82,10 @@ for remote memory access, inspired by r3map's managed mount architecture.
 Application
     ↓
 cached_memory_client
+    ├─ write_tracker (demand paging + dirty tracking)
+    │   ├─ uffd WP_ASYNC (Tier 1, kernel 6.2+)
+    │   ├─ uffd WP sync  (Tier 2, kernel 4.11+)
+    │   └─ mprotect+SIGSEGV (Tier 3, any POSIX)
     ├─ chunk_cache (page-level coherence)
     │   ├─ chunk_map: { offset → { local, dirty } }
     │   └─ background threads (puller + pusher)
@@ -101,31 +105,72 @@ cached_memory_client
 - **`alloc(size, out_addr)` / `free(addr)`** — Remote memory allocation and
   deallocation.
 
-- **`flush_dirty()`** — Sync all dirty pages to remote.
+- **`flush_dirty()`** — Sync all dirty pages to remote. Collects dirty pages
+  from the `write_tracker` (if demand paging is enabled), writes them into the
+  `chunk_cache`'s local store, then pushes all dirty chunks to the server via
+  `host_sync`. The ordering is critical: write_tracker dirty pages must be
+  written to the cache *before* `sync_dirty()` is called, otherwise they would
+  not be pushed.
 
 - **`invalidate(offsets)` / `invalidate_all()`** — Mark cached pages as
   non-local, forcing re-fetch on next access.
 
-- **`enable_demand_paging(base, size)`** (Linux only) — Register a shadow
-  memory region with userfaultfd. Page faults automatically trigger reads
-  through the chunk_cache.
+- **`enable_demand_paging(base, size)`** (Linux/POSIX) — Register a shadow
+  memory region with the `write_tracker`. The tracker handles both demand
+  paging (read faults → fetch from server via `chunk_cache`) and write
+  tracking (write faults → mark dirty for `flush_dirty()`). The factory
+  auto-selects the best available tier: uffd WP_ASYNC → uffd WP sync →
+  mprotect+SIGSEGV.
 
-### Demand Paging (Linux/userfaultfd)
+### Demand Paging + Write Tracking (Linux/userfaultfd, or mprotect fallback)
 
-On Linux, `cached_memory_client` can use `userfaultfd` for transparent demand
-paging:
+On Linux, `cached_memory_client` uses `write_tracker` for transparent demand
+paging and write tracking. The `write_tracker` is the single fault handler for
+the shadow region and serves both roles:
 
-1. A shadow memory region is `mmap`'d on the client
-2. `userfaultfd` is registered on this region
-3. When the application accesses a page in the shadow region, a page fault
-   occurs
-4. The fault handler reads the page from the remote server through
-   `chunk_cache`
-5. If the page is already cached, it's served from local store (no network!)
+**Read-side demand paging** — when the application first accesses a page:
+1. A shadow memory region is `mmap`'d on the client (PROT_NONE or registered
+   with userfaultfd)
+2. The first access triggers a page fault
+3. The fault handler calls `read_fault_cb`, which fetches the page from the
+   remote server through `chunk_cache`
+4. If the page is already cached, it's served from local store (no network!)
+5. The tracker installs the page (UFFDIO_COPY for uffd, mprotect+memcpy for
+   the fallback) and write-protects it for dirty tracking
 6. The fault is resolved and the application continues
 
-This makes remote memory appear as local memory — the application doesn't
-need to know that the data is on another machine.
+**Write-side dirty tracking** — when the application writes to an installed page:
+1. The write triggers a WP fault (uffd) or SIGSEGV (mprotect)
+2. The page is marked dirty in an internal bitmap
+3. The page is made writable (auto-resolved in WP_ASYNC, or via ioctl /
+   mprotect in sync modes)
+4. On the next `flush_dirty()`, dirty pages are collected and pushed to the
+   server via `host_sync` on the memory channel
+
+**Three-tier runtime selection** (`write_tracker::create()`):
+
+| Tier | Mechanism | Requirement | Description |
+|------|-----------|-------------|-------------|
+| 1 | userfaultfd WP + WP_ASYNC | Linux 6.2+ | Write faults auto-resolved by kernel; zero ioctls per write fault |
+| 2 | userfaultfd WP synchronous | Linux 4.11+ | One `UFFDIO_WRITEPROTECT` ioctl per first-write per page |
+| 3 | mprotect + SIGSEGV | Any POSIX | Fallback for containers where seccomp blocks `userfaultfd(2)` |
+
+The factory probes each tier at runtime and selects the best available. Tier 3
+is always available on POSIX systems, ensuring demand paging and write tracking
+work even in restricted environments (e.g., Docker containers with default
+seccomp profiles that return `EPERM` for `userfaultfd(2)`).
+
+**Address translation**: The `write_tracker` operates on absolute virtual
+addresses from the shadow region. The `cached_memory_client` stores the shadow
+region's base address and translates:
+- Absolute → offset for `chunk_cache` and `local_store` (in `read()`,
+  `write()`, `flush_dirty()`, and the `read_fault_cb`)
+- Offset → absolute for `rpc_remote_backend` (in `read_at()` and
+  `write_at()`, via `set_base()`)
+
+This ensures the server's `host_memory_mirror` receives the same absolute
+client addresses that CUDA RPC calls reference (e.g., the `srcHost` pointer
+in `cuMemcpyHtoD`).
 
 ## Chunk Cache
 
@@ -256,9 +301,8 @@ Memory operations use `frame_type::memory_op` (0x10) and
 for the frame format details.
 
 The `host_sync` (0x07) operation is the most important for CUDA pipelining.
-It allows the client to push host data to the server's mirror region without
-a separate round-trip — the data is packed inline in the `pipeline_mem`
-frame.
+It allows the client to push host data to the server's mirror region. This
+operates on the memory channel, separate from RPC traffic.
 
 
 ## Memory Operations
@@ -276,36 +320,36 @@ Defined in `include/zlink/memory.hpp`:
 | `host_sync` | 0x07 | Client→Server | Sync client host page to server mirror |
 | `host_read` | 0x08 | Server→Client | Read from mirrored client host memory |
 
-## Inline Memory Ops in pipeline_mem
+## Separation of RPC and Memory Data
 
-The `pipeline_mem` frame (frame_type 0x06) eliminates separate round-trips for
-memory operations by inlining them into the pipeline batch:
+Memory data flows on a separate channel from RPC calls. This is a deliberate
+architectural decision: RPC frames stay small (just call metadata + virtual
+handles), while bulk memory transfers use the memory channel without blocking
+RPC traffic.
 
-### Without pipeline_mem (3 round-trips for cuMemcpyHtoD):
-
-```
-1. host_sync frame → server mirrors data    [1 RT]
-2. request frame   → server calls cuMemcpyHtoD  [1 RT]
-3. response frame  → client gets CUresult    [1 RT]
-```
-
-### With pipeline_mem (1 round-trip):
+### cuMemcpyHtoD flow (2 channels, 1 RPC round-trip):
 
 ```
-1. pipeline_mem frame →
-   [sync: host data][rpc: cuMemcpyHtoD call]
-   → server processes: apply sync, execute call
-   → response: [rpc result]                 [1 RT]
+1. App writes to shadow region → write_tracker marks page dirty
+2. flush_dirty() → collect dirty pages → host_sync → server mirrors data  [memory channel]
+3. pipeline_request → server calls cuMemcpyHtoD using mirrored data       [RPC channel, 1 RT]
 ```
 
-### With pipeline_mem + readback for cuMemcpyDtoH (1 round-trip):
+The host_sync is sent before the RPC batch. The write_tracker transparently
+detects which pages were written; only dirty pages are pushed.
+
+### cuMemcpyDtoH flow (readback, 1 RPC round-trip + demand paging):
 
 ```
-1. pipeline_mem frame →
-   [sync: zero-fill dest buffer][rpc: cuMemcpyDtoH call][read: dest addr+size]
-   → server processes: apply sync, execute DtoH, read mirror data
-   → response: [rpc result][read data]      [1 RT]
+1. invalidate_all() → clear local cache for fresh data
+2. pipeline_request (flushes batch) → cuMemcpyDtoH writes to server mirror  [RPC channel, 1 RT]
+3. App reads shadow region → demand page fault → host_read → server sends    [memory channel]
+   mirror data back → page installed + cached for next read
 ```
+
+The readback buffer is accessed page-by-page via demand paging. The server's
+`memcpy_dto_h` handler auto-registers the mirror region for the readback
+address if it hasn't been synced by the client.
 
 ## Implementation: `src/memory_region.cpp`
 
@@ -313,3 +357,34 @@ The `sync_page()` method auto-registers mirror regions. When the server receives
 a `host_sync` for an address that isn't in a registered region, it automatically
 allocates a new mmap region to cover the address range. This allows the client
 to sync any host memory without prior registration.
+
+The server's `memcpy_dto_h` handler (in `examples/cuda/cuda_server.cpp`) also
+auto-registers the mirror region for readback buffer addresses that haven't
+been previously synced. This is necessary because the client's readback buffer
+is only written to by the server (via `cuMemcpyDtoH`), never synced from the
+client.
+
+### Address Translation
+
+The `cached_memory_client` stores the shadow region's base address
+(`impl_->shadow_base`) and translates between absolute virtual addresses
+(used by the shadow region, write_tracker, and CUDA RPC calls) and 0-based
+offsets (used by `chunk_cache` and `local_store`):
+
+```
+External (absolute addr)          Internal (offset)
+─────────────────────────         ──────────────────
+shadow_base + 0          ←→       0
+shadow_base + 4096       ←→       4096
+shadow_base + N          ←→       N
+
+read(addr)        →  cache_->read(addr - shadow_base)
+write(addr)       →  cache_->write(addr - shadow_base)
+flush_dirty()     →  cache_->write(r.addr - shadow_base, ...)
+read_fault_cb     →  cache_->read(fault_addr - shadow_base)
+```
+
+The `rpc_remote_backend` does the reverse translation: it adds `base_` to
+the offset when sending `host_sync` / `host_read` requests, so the server's
+`host_memory_mirror` receives the same absolute client addresses that CUDA
+RPC calls reference.

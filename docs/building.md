@@ -92,8 +92,9 @@ single machine for testing (client and server on localhost).
 Expected output (client):
 ```
 Connecting to 127.0.0.1:14833...
-Connected!
+Connected (multi-port: 3 channels)
 
+[client] demand paging + write tracking enabled
 === Phase 1: Setup (barriers) ===
 cuInit: 0 OK
 Driver version: 13000
@@ -109,7 +110,8 @@ cuCtxCreate: VH(0) — enqueued
 cuMemAlloc:  VH(1) — enqueued
 cuMemAlloc(2): VH(2) — enqueued
 cuStreamCreate: VH(3) — enqueued
-cuMemcpyHtoD(VH(1)): enqueued (inline sync)
+[client] flushed 2 dirty pages
+cuMemcpyHtoD(VH(1)): enqueued (dirty pages flushed)
 cuMemcpyDtoD: enqueued
 cuCtxSynchronize: enqueued
 
@@ -119,6 +121,7 @@ cuMemcpyDtoH result: 0 (SUCCESS)
 === Data Verification (DtoD round-trip) ===
   All 64 values match!
   VH pipeline verified: alloc+alloc+stream+HtoD+DtoD+sync+DtoH in 1 round-trip!
+  Demand paging + write tracking: WORKING
 
 === Phase 3: Event Pipeline Test ===
 cuEventCreate x2: VH(4), VH(5) — enqueued
@@ -141,7 +144,21 @@ Cleanup batch flushed: 4 results
 
 The entire Phase 2 batch (ctx create + 2× alloc + stream + HtoD + DtoD + sync)
 is enqueued with virtual handles and flushed in a single round-trip by the
-`cuMemcpyDtoH` readback call. This is the core zlink performance win.
+`cuMemcpyDtoH` readback call. The `[client] demand paging + write tracking
+enabled` line confirms the write_tracker was initialized; `[client] flushed N
+dirty pages` confirms the write tracker detected dirty pages in the shadow
+region and pushed them to the server.
+
+### Running in Containers (Docker, Kubernetes)
+
+When `userfaultfd(2)` is blocked by seccomp (the default Docker profile returns
+`EPERM`), the write_tracker transparently falls back to `mprotect` + `SIGSEGV`
+(Tier 3). No code changes or configuration are needed — the factory auto-selects
+the best available tier at runtime. The `[client] demand paging + write
+tracking enabled` message confirms the fallback is active.
+
+To enable `userfaultfd` in Docker, add `--security-opt seccomp=unconfined` or
+use a custom seccomp profile that allows syscall 323 (`userfaultfd`).
 
 ### Cross-Host Testing
 

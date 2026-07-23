@@ -215,7 +215,6 @@ multiplexed_transport::route_frame(const frame& f) const {
         // Bulk data channel: throughput-sensitive, large frames
         case frame_type::pipeline_request:
         case frame_type::pipeline_response:
-        case frame_type::pipeline_mem:
             return channel_id::bulk_data;
 
         // Memory ops: route by size
@@ -224,20 +223,6 @@ multiplexed_transport::route_frame(const frame& f) const {
             if (f.payload.size() >= bulk_threshold) {
                 return channel_id::bulk_data;
             }
-            return channel_id::rpc_control;
-
-        // Write-behind ACKs: small, go on RPC channel
-        case frame_type::write_ack:
-            return channel_id::rpc_control;
-
-        // Prefetch: background channel
-        case frame_type::prefetch_request:
-        case frame_type::prefetch_response:
-            return channel_id::prefetch;
-
-        // Session management: RPC channel
-        case frame_type::session_resume:
-        case frame_type::session_resume_ack:
             return channel_id::rpc_control;
 
         default:
