@@ -1,5 +1,8 @@
 # zlink Managed Pipeline Architecture
 
+> Based on the [r3map](https://github.com/pojntfx/r3map) managed mount model.
+> Research paper: [Networked Linux Memory Synchronization](https://pojntfx.github.io/networked-linux-memsync/main.pdf).
+>
 > Drawing on the r3map thesis findings to transform zlink from a synchronous
 > "direct mount" model into a high-throughput "managed mount" system that
 > sustains performance across WAN RTTs.

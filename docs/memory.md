@@ -2,7 +2,10 @@
 
 This document describes zlink's remote memory subsystem as implemented in
 `memory.hpp`, `chunk_cache.hpp`, `shared_mem.hpp`, `ptr_map.hpp`, and their
-corresponding `.cpp` files.
+corresponding `.cpp` files. The memory synchronization architecture is based
+on [r3map](https://github.com/pojntfx/r3map)'s managed mount model
+(SyncedReadWriterAt + Puller + Pusher). Research paper:
+[Networked Linux Memory Synchronization](https://pojntfx.github.io/networked-linux-memsync/main.pdf).
 
 ## Overview
 

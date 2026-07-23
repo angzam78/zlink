@@ -183,5 +183,5 @@ MIT
 ## Acknowledgments
 
 - [zpp_bits](https://github.com/eyalz800/zpp_bits) — C++20 serialization & RPC
-- [r3map](https://github.com/pojntfx/r3map) — Remote memory region mounting
+- [r3map](https://github.com/pojntfx/r3map) — Remote memory region mounting; research paper: [Networked Linux Memory Synchronization](https://pojntfx.github.io/networked-linux-memsync/main.pdf)
 - [Lupine](https://github.com/lupinemachines/lupine) — GPU-over-IP inspiration

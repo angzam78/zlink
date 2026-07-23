@@ -1,7 +1,9 @@
 # RPC Framework
 
-zlink's RPC framework is built on zpp_bits, a C++20 header-only library that
-provides binary serialization and RPC with zero code generation.
+zlink's RPC framework is built on [zpp_bits](https://github.com/eyalz800/zpp_bits),
+a C++20 header-only library that provides binary serialization and RPC with zero
+code generation. All request/response framing, pipeline batch serialization, and
+server dispatch in zlink use zpp_bits under the hood.
 
 ## zpp_bits Overview
 
@@ -10,17 +12,19 @@ compile time. The `zpp::bits::rpc<>` template takes a list of `zpp::bits::bind<>
 entries, each mapping a function pointer to an integer index.
 
 ```cpp
-using cuda_test_rpc = zpp::bits::rpc<
-    zpp::bits::bind<&cuda_rpc_api::cuda_init,           0>,
-    zpp::bits::bind<&cuda_rpc_api::get_device_count,    1>,
-    zpp::bits::bind<&cuda_rpc_api::ctx_create,          4>,
-    zpp::bits::bind<&cuda_rpc_api::mem_alloc,           7>,
-    // ...
+using cuda_gen_rpc = zpp::bits::rpc<
+    zpp::bits::bind<&init,                  func_index::init>,
+    zpp::bits::bind<&device_get_count,      func_index::device_get_count>,
+    zpp::bits::bind<&ctx_create,            func_index::ctx_create>,
+    zpp::bits::bind<&mem_alloc,             func_index::mem_alloc>,
+    // ... 30 functions total, indices 0-29
 >;
 ```
 
 The index is part of the serialized request so the server knows which function
-to dispatch. Client and server must use the same binding indices.
+to dispatch. Client and server must use the same binding indices. zlink uses
+named constants in the `func_index` namespace (e.g., `func_index::mem_alloc = 12`)
+rather than raw literals, so the binding is self-documenting.
 
 ## API Declaration Pattern
 
@@ -30,23 +34,23 @@ zlink is:
 ### 1. Declare return types and function signatures
 
 ```cpp
-namespace cuda_rpc_api {
+namespace cuda_gen {
 
-struct AllocRet { int32_t result; std::uint64_t dev_ptr; };
-AllocRet mem_alloc(std::uint64_t bytesize);
+struct MemAllocRet { int32_t result; uint64_t dptr; };
+MemAllocRet mem_alloc(uint64_t bytesize);
 
-struct FreeRet { int32_t result; };
-FreeRet mem_free(std::uint64_t dev_ptr);
+struct MemFreeRet { int32_t result; };
+MemFreeRet mem_free(uint64_t dptr);
 
-} // namespace cuda_rpc_api
+} // namespace cuda_gen
 ```
 
 ### 2. Define the RPC binding
 
 ```cpp
-using cuda_test_rpc = zpp::bits::rpc<
-    zpp::bits::bind<&cuda_rpc_api::mem_alloc, 7>,
-    zpp::bits::bind<&cuda_rpc_api::mem_free,  8>,
+using cuda_gen_rpc = zpp::bits::rpc<
+    zpp::bits::bind<&mem_alloc, func_index::mem_alloc>,
+    zpp::bits::bind<&mem_free,  func_index::mem_free>,
 >;
 ```
 
@@ -54,7 +58,7 @@ using cuda_test_rpc = zpp::bits::rpc<
 
 ```cpp
 // In the same namespace — zpp_bits calls these via the function pointer
-AllocRet mem_alloc(std::uint64_t bytesize) {
+MemAllocRet mem_alloc(uint64_t bytesize) {
     CUdeviceptr ptr = 0;
     CUresult r = cuMemAlloc(&ptr, bytesize);
     return {static_cast<int32_t>(r), ptr};
@@ -64,9 +68,9 @@ AllocRet mem_alloc(std::uint64_t bytesize) {
 ### 4. Client: call through the pipeline
 
 ```cpp
-zlink::cuda_pipeline<cuda_test_rpc> pipe(*tp);
-auto r = pipe.call_barrier<7>(static_cast<uint64_t>(256));
-// r.dev_ptr contains the device pointer
+zlink::cuda_pipeline<cuda_gen_rpc> pipe(*tp);
+auto r = pipe.call_barrier<cuda_gen::func_index::mem_alloc>(static_cast<uint64_t>(256));
+// r.dptr contains the device pointer
 ```
 
 ## Key Classes
@@ -76,8 +80,8 @@ auto r = pipe.call_barrier<7>(static_cast<uint64_t>(256));
 Typed synchronous RPC client. Uses `call<FuncIndex>(args...)` for individual calls.
 
 ```cpp
-zlink::rpc_client<cuda_test_rpc> client(transport);
-auto result = client.call<0>(0u);  // cuInit(0)
+zlink::rpc_client<cuda_gen_rpc> client(transport);
+auto result = client.call<cuda_gen::func_index::init>(0u);  // cuInit(0)
 ```
 
 Internal flow:
@@ -91,7 +95,7 @@ Internal flow:
 Typed RPC server. Dispatches incoming requests to the bound functions.
 
 ```cpp
-zlink::rpc_server<cuda_test_rpc> server(transport);
+zlink::rpc_server<cuda_gen_rpc> server(transport);
 server.serve_forever();
 ```
 
@@ -101,9 +105,9 @@ Simple pipeline batcher — queues calls and flushes as `pipeline_request`.
 Predecessor to `cuda_pipeline`, kept for non-CUDA use cases.
 
 ```cpp
-zlink::pipeline_caller<cuda_test_rpc> pipe(transport);
-pipe.push<7>(static_cast<uint64_t>(256));
-pipe.push<8>(dev_ptr);
+zlink::pipeline_caller<cuda_gen_rpc> pipe(transport);
+pipe.push<cuda_gen::func_index::mem_alloc>(static_cast<uint64_t>(256));
+pipe.push<cuda_gen::func_index::mem_free>(dev_ptr);
 auto results = pipe.flush();
 ```
 

@@ -131,19 +131,19 @@ network RPC. Key classes:
 **API declaration pattern**: Both client and server share the same API type:
 
 ```cpp
-// In a shared header:
-namespace cuda_rpc_api {
-    struct AllocRet { int32_t result; uint64_t dev_ptr; };
-    AllocRet mem_alloc(uint64_t bytesize);
+// In a shared header (examples/cuda/cuda_api.hpp):
+namespace cuda_gen {
+    struct MemAllocRet { int32_t result; uint64_t dptr; };
+    MemAllocRet mem_alloc(uint64_t bytesize);
 }
 
-using cuda_rpc = zpp::bits::rpc<
-    zpp::bits::bind<&cuda_rpc_api::mem_alloc, 7>
+using cuda_gen_rpc = zpp::bits::rpc<
+    zpp::bits::bind<&mem_alloc, func_index::mem_alloc>
 >;
 ```
 
-The integer bind IDs (0, 1, 2, ...) are the wire-level function identifiers.
-Client and server must use the same IDs.
+The integer bind IDs (stored in `func_index::*` constants, 0-29) are the
+wire-level function identifiers. Client and server must use the same IDs.
 
 ### 3. CUDA Pipeline (`cuda_pipeline.hpp`)
 
@@ -327,9 +327,18 @@ A typical CUDA workload goes through these phases:
 
 ## Dependencies
 
-- **zpp_bits** — Header-only C++20 binary serialization + RPC framework.
-  Fetched at build time via CMake `FetchContent`. Provides `zpp::bits::rpc<>`,
-  `zpp::bits::bind<>`, and `data_in_out()` for zero-overhead serialization.
+- **[zpp_bits](https://github.com/eyalz800/zpp_bits)** — Header-only C++20
+  binary serialization + RPC framework. Fetched at build time via CMake
+  `FetchContent`. Provides `zpp::bits::rpc<>`, `zpp::bits::bind<>`, and
+  `data_in_out()` for zero-overhead serialization. zlink's entire RPC layer
+  (request/response framing, pipeline batch serialization, server dispatch)
+  is built on zpp_bits.
+
+- **[r3map](https://github.com/pojntfx/r3map)** — Remote memory region
+  mounting library. zlink's memory synchronization subsystem (chunk cache,
+  host memory mirror, shared memory plane) is based on r3map's managed mount
+  architecture (SyncedReadWriterAt + Puller + Pusher pattern). The research
+  paper is at <https://pojntfx.github.io/networked-linux-memsync/main.pdf>.
 
 - **C++20** — Required for concepts, `std::span`, designated initializers.
 
