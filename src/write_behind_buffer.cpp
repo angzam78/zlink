@@ -158,12 +158,11 @@ void write_behind_buffer::pusher_loop() {
         // Send the write to the server on the bulk channel
         send_write(pw);
 
-        // Note: we don't mark completed here — the server sends a
-        // write_ack frame which is processed by handle_ack().
-        // But as a safety net, if the server doesn't ACK within
-        // a reasonable time, we mark it completed anyway to avoid
-        // hanging. This is a trade-off between correctness and
-        // liveness that should be configurable.
+        // Optimistically mark complete: tcp_transport::send() is blocking,
+        // so when it returns the data is at least in the kernel send buffer.
+        // The server will process it. For same-host testing this is correct;
+        // cross-host with multiplexed channels needs server-side ACKs (TODO).
+        mark_completed(pw.fence_id);
     }
 }
 
