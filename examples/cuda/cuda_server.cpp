@@ -14,6 +14,7 @@
 
 #include <zlink/transport.hpp>
 #include <zlink/tcp_transport.hpp>
+#include <zlink/multiplexed_transport.hpp>
 #include <zlink/config.hpp>
 #include <zlink/virtual_handle.hpp>
 #include <zlink/compress.hpp>
@@ -624,7 +625,7 @@ int main() {
     if (dev_count == 0) { std::cerr << "[server] no CUDA devices\n"; return 1; }
 
     cuda_rpc_server server;
-    auto tp = zlink::make_transport(zlink::transport_kind::tcp);
+    auto tp = std::make_unique<zlink::multiplexed_transport>();
     server.serve(*tp);
     return 0;
 }

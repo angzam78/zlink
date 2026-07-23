@@ -12,11 +12,17 @@
 // readback call. This is the core zlink performance win.
 //
 // Run: cuda_client [host [port]]
+//
+// Environment variables:
+//   ZLINK_MANAGED=1  Enable managed pipeline (prefetch + write-behind + multiplexed transport)
+//   ZLINK_MANAGED unset or 0  Use plain pipeline behavior (inline sync, no background workers)
 
 #include <zlink/transport.hpp>
 #include <zlink/tcp_transport.hpp>
 #include <zlink/config.hpp>
 #include <zlink/cuda_pipeline.hpp>
+#include <zlink/managed_pipeline.hpp>
+#include <zlink/multiplexed_transport.hpp>
 #include <zlink/virtual_handle.hpp>
 
 #include "cuda_api.hpp"
@@ -31,42 +37,42 @@
 #include <cstdint>
 #include <cmath>
 
-using pipe_t = zlink::cuda_pipeline<cuda_gen::cuda_gen_rpc>;
+using pipe_t = zlink::managed_pipeline<cuda_gen::cuda_gen_rpc>;
 
 // ── BARRIER WRAPPERS ───────────────────────────────────────────────────
 
 static int32_t cu_init(pipe_t& pipe, unsigned int flags = 0) {
-    auto r = pipe.call_barrier<cuda_gen::func_index::init>(flags);
+    auto r = pipe.call_barrier_managed<cuda_gen::func_index::init>(flags);
     return r.result;
 }
 static int32_t cu_driver_get_version(pipe_t& pipe, int& out_ver) {
-    auto r = pipe.call_barrier<cuda_gen::func_index::driver_get_version>();
+    auto r = pipe.call_barrier_managed<cuda_gen::func_index::driver_get_version>();
     out_ver = r.driverVersion;
     return r.result;
 }
 static int32_t cu_device_get_count(pipe_t& pipe, int& out_count) {
-    auto r = pipe.call_barrier<cuda_gen::func_index::device_get_count>();
+    auto r = pipe.call_barrier_managed<cuda_gen::func_index::device_get_count>();
     out_count = r.count;
     return r.result;
 }
 static int32_t cu_device_get_name(pipe_t& pipe, int ordinal, std::string& out_name) {
-    auto r = pipe.call_barrier<cuda_gen::func_index::device_get_name>(128, ordinal);
+    auto r = pipe.call_barrier_managed<cuda_gen::func_index::device_get_name>(128, ordinal);
     out_name = r.name;
     return r.result;
 }
 static int32_t cu_device_total_mem(pipe_t& pipe, int ordinal, uint64_t& out_bytes) {
-    auto r = pipe.call_barrier<cuda_gen::func_index::device_total_mem>(ordinal);
+    auto r = pipe.call_barrier_managed<cuda_gen::func_index::device_total_mem>(ordinal);
     out_bytes = r.bytes;
     return r.result;
 }
 static int32_t cu_device_get_attribute(pipe_t& pipe, int attrib, int dev, int32_t& out_value) {
-    auto r = pipe.call_barrier<cuda_gen::func_index::device_get_attribute>(
+    auto r = pipe.call_barrier_managed<cuda_gen::func_index::device_get_attribute>(
         static_cast<uint32_t>(attrib), dev);
     out_value = r.value;
     return r.result;
 }
 static int32_t cu_mem_get_info(pipe_t& pipe, uint64_t& free_bytes, uint64_t& total_bytes) {
-    auto r = pipe.call_barrier<cuda_gen::func_index::mem_get_info>();
+    auto r = pipe.call_barrier_managed<cuda_gen::func_index::mem_get_info>();
     free_bytes = r.free_bytes;
     total_bytes = r.total_bytes;
     return r.result;
@@ -119,7 +125,7 @@ static void cu_event_synchronize(pipe_t& pipe, uint64_t event_vh) {
 // cuMemcpyHtoD: consumes VH(dev_ptr) + inline host_sync (data packed into frame)
 static void cu_memcpy_htod(pipe_t& pipe, uint64_t dev_vh,
                            const void* host_data, uint64_t byte_count) {
-    pipe.enqueue_with_sync<cuda_gen::func_index::memcpy_hto_d>(
+    pipe.enqueue_with_sync_managed<cuda_gen::func_index::memcpy_hto_d>(
         host_data, static_cast<std::size_t>(byte_count),
         dev_vh,
         static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(host_data)),
@@ -137,7 +143,7 @@ static void cu_memcpy_dtod(pipe_t& pipe, uint64_t dst_vh, uint64_t src_vh, uint6
 // client. All packed into one pipeline_mem round-trip.
 static int32_t cu_memcpy_dtoh(pipe_t& pipe, void* host_data,
                               uint64_t dev_vh, uint64_t byte_count) {
-    auto results = pipe.call_readback_with_sync_read<cuda_gen::func_index::memcpy_dto_h>(
+    auto results = pipe.call_readback_managed<cuda_gen::func_index::memcpy_dto_h>(
         host_data, static_cast<std::size_t>(byte_count),
         static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(host_data)),
         dev_vh,
@@ -156,7 +162,7 @@ static int32_t cu_memcpy_dtoh(pipe_t& pipe, void* host_data,
 
 // ── BARRIER: cuEventElapsedTime (needs the float value) ─────────────────
 static int32_t cu_event_elapsed_time(pipe_t& pipe, uint64_t start_evh, uint64_t end_evh, float& out_ms) {
-    auto r = pipe.call_barrier<cuda_gen::func_index::event_elapsed_time>(start_evh, end_evh);
+    auto r = pipe.call_barrier_managed<cuda_gen::func_index::event_elapsed_time>(start_evh, end_evh);
     out_ms = r.milliseconds;
     return r.result;
 }
@@ -170,13 +176,35 @@ int main(int argc, char* argv[]) {
     if (argc > 1) host = argv[1];
     if (argc > 2) port = static_cast<std::uint16_t>(std::stoi(argv[2]));
 
-    auto tp = zlink::make_transport(zlink::transport_kind::tcp);
-    std::cout << "Connecting to " << host << ":" << port << "...\n";
-    auto ec = tp->connect(host, port);
-    if (ec) { std::cerr << "connect failed: " << ec.message() << "\n"; return 1; }
-    std::cout << "Connected!\n\n";
+    // ── Check ZLINK_MANAGED env var ──────────────────────────────
+    const char* managed_env = std::getenv("ZLINK_MANAGED");
+    bool use_managed = managed_env && managed_env[0] == '1';
 
-    pipe_t pipe(*tp);
+    zlink::multiplexed_transport mtp;
+    std::cout << "Connecting to " << host << ":" << port << "...\n";
+    if (use_managed) {
+        std::cout << "Managed pipeline ENABLED (prefetch + write-behind)\n";
+    } else {
+        std::cout << "Managed pipeline DISABLED (inline sync, no background workers)\n";
+    }
+    auto ec = mtp.connect(host, port);
+    if (ec) { std::cerr << "connect failed: " << ec.message() << "\n"; return 1; }
+    std::cout << "Connected"
+              << (mtp.is_multi_port() ? " (multi-port mode)" : " (single-connection mode)")
+              << "\n\n";
+
+    // ── Create managed pipeline (workers toggled by config) ──────
+    zlink::managed_pipeline_config mcfg;
+    mcfg.enable_prefetch     = use_managed;
+    mcfg.enable_write_behind = use_managed;
+
+    pipe_t pipe(mtp, mcfg);
+
+    // Prefetch needs a chunk_cache wired via set_cache().
+    // For now, prefetch is enabled but has no cache to pull from —
+    // it will simply not prefetch anything (no-op). Write-behind
+    // works independently of the cache.
+    pipe.start();
 
     // ── Phase 1: Setup (barrier calls) ────────────────────────────────
     std::cout << "=== Phase 1: Setup (barriers) ===\n";
@@ -292,7 +320,7 @@ int main(int argc, char* argv[]) {
     std::cout << "cuEventSynchronize(end): enqueued\n";
 
     // Flush the event batch
-    auto event_results = pipe.flush();
+    auto event_results = pipe.flush_managed();
     std::cout << "Event batch flushed: " << event_results.size() << " results\n";
 
     // cuEventElapsedTime is a barrier (needs the float value)
@@ -335,10 +363,11 @@ int main(int argc, char* argv[]) {
     cu_stream_destroy(pipe, stream_vh);
     std::cout << "Cleanup (3×mem_free + stream_destroy): enqueued\n";
 
-    auto final_results = pipe.flush();
+    auto final_results = pipe.flush_managed();
     std::cout << "Cleanup batch flushed: " << final_results.size() << " results\n";
 
     std::cout << "\n=== All tests complete ===\n";
-    tp->close();
+    pipe.stop();
+    mtp.close();
     return 0;
 }
