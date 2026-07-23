@@ -139,32 +139,18 @@ public:
     }
 
     // ── Managed enqueue_with_sync: uses write-behind ─────────────
-    // Instead of inlining sync data in the pipeline frame, buffer
-    // the write asynchronously and return immediately.
-    //
-    // If write_behind is disabled or data is small, falls back to
-    // the existing inline sync behavior.
+    // Currently falls back to inline sync because the server's
+    // pipeline_mem handler expects sync data inline — it can't match
+    // separately-received write-behind data to pending RPC calls yet.
+    // Write-behind requires server-side protocol changes (TODO).
     template<auto FuncIndex, typename... Args>
     void enqueue_with_sync_managed(
         const void* host_ptr, std::size_t sync_size,
         Args&&... args)
     {
-        if (write_behind_ && host_ptr && sync_size > 0) {
-            // Buffer the write asynchronously — don't block
-            auto fence = write_behind_->buffer_write(
-                reinterpret_cast<std::uintptr_t>(host_ptr),
-                std::span<const std::byte>(
-                    reinterpret_cast<const std::byte*>(host_ptr), sync_size));
-            pending_fences_.push_back(std::move(fence));
-
-            // Enqueue the RPC call without inline sync data
-            // (data will arrive via write-behind push)
-            this->template enqueue<FuncIndex>(std::forward<Args>(args)...);
-        } else {
-            // Fall back to inline sync (existing behavior)
-            this->template enqueue_with_sync<FuncIndex>(
-                host_ptr, sync_size, std::forward<Args>(args)...);
-        }
+        // Fall back to inline sync (existing behavior)
+        this->template enqueue_with_sync<FuncIndex>(
+            host_ptr, sync_size, std::forward<Args>(args)...);
 
         // Record access for prefetch pattern detection
         if (prefetch_ && host_ptr) {
@@ -174,26 +160,16 @@ public:
     }
 
     // ── Managed enqueue_produces_handle_with_sync ────────────────
-    // Same as above but returns a virtual handle
+    // Same as above but returns a virtual handle. Also falls back to
+    // inline sync until server-side write-behind support is added.
     template<auto FuncIndex, typename... Args>
     std::uint32_t enqueue_produces_handle_with_sync_managed(
         const void* host_ptr, std::size_t sync_size,
         Args&&... args)
     {
-        if (write_behind_ && host_ptr && sync_size > 0) {
-            auto fence = write_behind_->buffer_write(
-                reinterpret_cast<std::uintptr_t>(host_ptr),
-                std::span<const std::byte>(
-                    reinterpret_cast<const std::byte*>(host_ptr), sync_size));
-            pending_fences_.push_back(std::move(fence));
-
-            // Enqueue without inline sync
-            return this->template enqueue_produces_handle<FuncIndex>(
-                std::forward<Args>(args)...);
-        } else {
-            return this->template enqueue_produces_handle_with_sync<FuncIndex>(
-                host_ptr, sync_size, std::forward<Args>(args)...);
-        }
+        // Fall back to inline sync (existing behavior)
+        return this->template enqueue_produces_handle_with_sync<FuncIndex>(
+            host_ptr, sync_size, std::forward<Args>(args)...);
     }
 
     // ── Managed readback: records access pattern ─────────────────
