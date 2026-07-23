@@ -5,6 +5,21 @@
 #include <cstring>
 #include <algorithm>
 
+#ifdef ZLINK_LINUX
+    #include <poll.h>
+    #include <sys/socket.h>
+    #include <netinet/in.h>
+    #include <unistd.h>
+#elif ZLINK_WINDOWS
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+    #pragma comment(lib, "ws2_32.lib")
+#else
+    #include <poll.h>
+    #include <sys/socket.h>
+    #include <unistd.h>
+#endif
+
 namespace zlink {
 
 // ── 16KB threshold: above this, memory ops go to bulk channel ────────
@@ -93,12 +108,46 @@ std::error_code multiplexed_transport::send(const frame& f) {
 }
 
 std::error_code multiplexed_transport::receive(frame& out) {
-    // Default receive: try RPC control channel first
-    if (multi_port_mode_.load()) {
-        return receive_on(channel_id::rpc_control, out);
-    }
     // Single-connection mode: just receive from channel 0
-    return channels_[0]->receive(out);
+    if (!multi_port_mode_.load()) {
+        return channels_[0]->receive(out);
+    }
+
+    // Multi-port mode: poll across all channels and read from whichever has data
+    std::array<struct pollfd, 3> pfds{};
+    int active = 0;
+    for (int i = 0; i < 3; i++) {
+        int fd = channels_[i]->native_handle();
+        if (fd >= 0) {
+            pfds[active].fd = fd;
+            pfds[active].events = POLLIN;
+            active++;
+        }
+    }
+
+    if (active == 0) {
+        return std::make_error_code(std::errc::not_connected);
+    }
+
+    // Block until at least one channel has data
+    int ret = ::poll(pfds.data(), active, -1);
+    if (ret < 0) {
+        return std::make_error_code(std::errc::io_error);
+    }
+
+    // Find the first readable channel and receive from it
+    for (int i = 0; i < active; i++) {
+        if (pfds[i].revents & (POLLIN | POLLHUP | POLLERR)) {
+            // Find which channel this fd belongs to
+            for (int ch = 0; ch < 3; ch++) {
+                if (channels_[ch]->native_handle() == pfds[i].fd) {
+                    return channels_[ch]->receive(out);
+                }
+            }
+        }
+    }
+
+    return std::make_error_code(std::errc::io_error);
 }
 
 void multiplexed_transport::close() noexcept {

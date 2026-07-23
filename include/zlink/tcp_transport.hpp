@@ -22,6 +22,9 @@ public:
     void           close() noexcept override;
     bool           is_connected() const noexcept override;
 
+    // Expose socket fd for poll()-based multiplexing
+    int native_handle() const noexcept { return sock_fd_; }
+
 private:
     // Platform-specific socket handle
     int sock_fd_ = -1;
