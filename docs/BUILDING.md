@@ -25,26 +25,24 @@ This produces:
 
 ### CUDA Examples
 
-The CUDA examples require `libcuda.so` on the server side. They are built
-manually (not integrated into the main CMakeLists.txt yet) because they
-need the CUDA toolkit. See `examples/cuda/` for source files.
-
-Build the CUDA test client and server with:
+The CUDA examples are integrated into the CMake build and enabled with
+`-DZLINK_CUDA_EXAMPLES=ON`. The server target requires the CUDA toolkit
+(`find_package(CUDAToolkit)`); the client target builds on any machine.
 
 ```bash
-cd zlink
-g++ -std=c++20 -O2 \
-    -I include -I build/_deps/zpp_bits-src \
-    examples/cuda/cuda_test_client.cpp \
-    -L build -lzlink_core -lpthread \
-    -o build/cuda_test_client
-
-g++ -std=c++20 -O2 \
-    -I include -I build/_deps/zpp_bits-src \
-    examples/cuda/cuda_test_server.cpp \
-    -L build -lzlink_core -lpthread -lcuda \
-    -o build/cuda_test_server
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DZLINK_CUDA_EXAMPLES=ON
+cmake --build build -j$(nproc)
 ```
+
+This produces:
+
+- `build/examples/cuda/cuda_server` — GPU server (needs CUDA toolkit)
+- `build/examples/cuda/cuda_client` — Pipeline client (CPU-only, no CUDA needed)
+
+The server and client share `cuda_api.hpp`, a hand-written set of CUDA Driver
+API RPC declarations (30 functions) with zpp_bits `bind<>` entries. Adding a
+new function requires three lines: declare the return struct + signature, add
+a `bind<>` entry, and categorize it (barrier / enqueued / readback).
 
 ## Running the Examples
 
@@ -83,12 +81,12 @@ single machine for testing (client and server on localhost).
 
 **Terminal 1 (GPU server):**
 ```bash
-./build/cuda_test_server 14833
+./build/examples/cuda/cuda_server
 ```
 
 **Terminal 2 (client — can be CPU-only in production):**
 ```bash
-./build/cuda_test_client 127.0.0.1 14833
+./build/examples/cuda/cuda_client 127.0.0.1 14833
 ```
 
 Expected output (client):
@@ -98,37 +96,52 @@ Connected!
 
 === Phase 1: Setup (barriers) ===
 cuInit: 0 OK
-Device count: 1
-GPU 0: NVIDIA GeForce RTX 4090
-Total memory: 24564 MB
+Driver version: 13000
+Device count: 2
+GPU 0: NVIDIA GeForce RTX 3090
+Total memory: 24122 MB
+Warp size: 64
 
 === Phase 2: Virtual Handle Pipeline ===
 ALL calls enqueued — NO barriers between alloc/HtoD/sync!
 
 cuCtxCreate: VH(0) — enqueued
-cuMemAlloc: VH(1) — enqueued
-cuMemcpyHtoD(VH(1)): enqueued + inline sync
+cuMemAlloc:  VH(1) — enqueued
+cuMemAlloc(2): VH(2) — enqueued
+cuStreamCreate: VH(3) — enqueued
+cuMemcpyHtoD(VH(1)): enqueued (inline sync)
+cuMemcpyDtoD: enqueued
 cuCtxSynchronize: enqueued
 
 === cuMemcpyDtoH: READBACK — flushing pipeline ===
-Pipeline sends: [sync_data][ctx_create][mem_alloc][memcpy_htod]
-[ctx_sync][memcpy_dtoh][read_req][handle_manifest]
-Server processes in order, translates VH → real handles
-
 cuMemcpyDtoH result: 0 (SUCCESS)
 
-=== Data Verification ===
+=== Data Verification (DtoD round-trip) ===
   All 64 values match!
-  Virtual handle pipeline verified: alloc→HtoD→sync→DtoH in 1 round-trip!
+  VH pipeline verified: alloc+alloc+stream+HtoD+DtoD+sync+DtoH in 1 round-trip!
 
-Cleanup: cuMemFree + cuCtxDestroy enqueued
-Final flush: 2 deferred calls
+=== Phase 3: Event Pipeline Test ===
+cuEventCreate x2: VH(4), VH(5) — enqueued
+cuEventRecord(start): enqueued
+cuEventRecord(end): enqueued
+cuEventSynchronize(end): enqueued
+Event batch flushed: 5 results
+cuEventElapsedTime: 0 OK, 0.002048 ms
 
-=== Pipeline Benchmark: Virtual Handles vs Barriers ===
-  Virtual handles (1-2 round-trips):  XXX us
-  Barrier style (3+ round-trips):     XXX us
-  Speedup: X.XXx
+=== Phase 4: Managed Memory + Cleanup ===
+cuMemAllocManaged: VH(6) — enqueued
+cuMemcpyHtoD(managed) + cuCtxSynchronize: enqueued
+cuMemcpyDtoH(managed) result: 0 (SUCCESS)
+  Managed memory round-trip: VERIFIED
+Cleanup (3×mem_free + stream_destroy): enqueued
+Cleanup batch flushed: 4 results
+
+=== All tests complete ===
 ```
+
+The entire Phase 2 batch (ctx create + 2× alloc + stream + HtoD + DtoD + sync)
+is enqueued with virtual handles and flushed in a single round-trip by the
+`cuMemcpyDtoH` readback call. This is the core zlink performance win.
 
 ### Cross-Host Testing
 
@@ -136,12 +149,12 @@ To test between two machines:
 
 1. On the GPU server, start the server listening on all interfaces:
    ```bash
-   ./build/cuda_test_server 0.0.0.0 14833
+   ./build/examples/cuda/cuda_server
    ```
 
 2. On the CPU-only client, connect to the server:
    ```bash
-   ./build/cuda_test_client 192.168.1.100 14833
+   ./build/examples/cuda/cuda_client 192.168.1.100 14833
    ```
 
 ## Project Configuration
@@ -165,5 +178,6 @@ Environment variables (alternative to config file):
 |--------|---------|-------------|
 | `CMAKE_BUILD_TYPE` | `Debug` | Build type (`Release` recommended for benchmarks) |
 | `CMAKE_CXX_STANDARD` | `20` | C++ standard (must be 20 or later) |
+| `ZLINK_CUDA_EXAMPLES` | `OFF` | Enable CUDA server + client targets (requires CUDAToolkit for server) |
 
 The build uses `-Wall -Wextra -Wpedantic` and `-O2` in Release mode.

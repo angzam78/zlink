@@ -25,35 +25,18 @@ This builds:
 
 ### CUDA Examples
 
-The CUDA examples are not in the CMake build system (they require CUDA on the
-build machine). Use the build scripts:
+The CUDA examples are integrated into the CMake build and enabled with
+`-DZLINK_CUDA_EXAMPLES=ON`. The server target requires the CUDA toolkit
+(`find_package(CUDAToolkit)`); the client target builds on any machine.
 
 ```bash
-# Build and test pipeline on the same machine
-python3 scripts/build_test_pipeline.py
-
-# Build and test across two machines
-python3 scripts/cross_host_test.py <server_host> [port]
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DZLINK_CUDA_EXAMPLES=ON
+cmake --build build -j$(nproc)
 ```
 
-Or compile manually:
-
-```bash
-# Server (needs CUDA)
-g++ -std=c++20 -O2 \
-    -I include -I build/_deps/zpp_bits-src \
-    examples/cuda/cuda_test_server.cpp \
-    -L build -lzlink_core -llz4 -lpthread \
-    -lcuda \
-    -o cuda_test_server
-
-# Client (CPU-only, no CUDA needed)
-g++ -std=c++20 -O2 \
-    -I include -I build/_deps/zpp_bits-src \
-    examples/cuda/cuda_test_client.cpp \
-    -L build -lzlink_core -llz4 -lpthread \
-    -o cuda_test_client
-```
+This builds:
+- `examples/cuda/cuda_server` — GPU server (needs CUDA toolkit)
+- `examples/cuda/cuda_client` — Pipeline client (CPU-only, no CUDA needed)
 
 ## Running the CUDA Example
 
@@ -61,24 +44,24 @@ g++ -std=c++20 -O2 \
 
 Terminal 1 (server — needs GPU):
 ```bash
-./cuda_test_server 14833
+./build/examples/cuda/cuda_server
 ```
 
 Terminal 2 (client — can be CPU-only):
 ```bash
-./cuda_test_client 127.0.0.1 14833
+./build/examples/cuda/cuda_client 127.0.0.1 14833
 ```
 
 ### Cross-Machine
 
 On the GPU server:
 ```bash
-./cuda_test_server 14833
+./build/examples/cuda/cuda_server
 ```
 
 On the CPU-only client:
 ```bash
-./cuda_test_client 192.168.1.100 14833
+./build/examples/cuda/cuda_client 192.168.1.100 14833
 ```
 
 ### Expected Output
@@ -90,29 +73,47 @@ Connected!
 
 === Phase 1: Setup (barriers) ===
 cuInit: 0 OK
-Device count: 1
-GPU 0: NVIDIA GeForce RTX 4090
-Total memory: 24564 MB
+Driver version: 13000
+Device count: 2
+GPU 0: NVIDIA GeForce RTX 3090
+Total memory: 24122 MB
+Warp size: 64
 
 === Phase 2: Virtual Handle Pipeline ===
 ALL calls enqueued — NO barriers between alloc/HtoD/sync!
 
 cuCtxCreate: VH(0) — enqueued
-cuMemAlloc: VH(1) — enqueued
-cuMemcpyHtoD(VH(1)): enqueued + inline sync
+cuMemAlloc:  VH(1) — enqueued
+cuMemAlloc(2): VH(2) — enqueued
+cuStreamCreate: VH(3) — enqueued
+cuMemcpyHtoD(VH(1)): enqueued (inline sync)
+cuMemcpyDtoD: enqueued
 cuCtxSynchronize: enqueued
 
 === cuMemcpyDtoH: READBACK — flushing pipeline ===
-...
+cuMemcpyDtoH result: 0 (SUCCESS)
 
-=== Data Verification ===
+=== Data Verification (DtoD round-trip) ===
   All 64 values match!
-  Virtual handle pipeline verified: alloc→HtoD→sync→DtoH in 1 round-trip!
+  VH pipeline verified: alloc+alloc+stream+HtoD+DtoD+sync+DtoH in 1 round-trip!
 
-=== Pipeline Benchmark: Virtual Handles vs Barriers ===
-  Virtual handles (1-2 round-trips):  XXX us
-  Barrier style (3+ round-trips):     XXX us
-  Speedup: X.XXx
+=== Phase 3: Event Pipeline Test ===
+cuEventCreate x2: VH(4), VH(5) — enqueued
+cuEventRecord(start): enqueued
+cuEventRecord(end): enqueued
+cuEventSynchronize(end): enqueued
+Event batch flushed: 5 results
+cuEventElapsedTime: 0 OK, 0.002048 ms
+
+=== Phase 4: Managed Memory + Cleanup ===
+cuMemAllocManaged: VH(6) — enqueued
+cuMemcpyHtoD(managed) + cuCtxSynchronize: enqueued
+cuMemcpyDtoH(managed) result: 0 (SUCCESS)
+  Managed memory round-trip: VERIFIED
+Cleanup (3×mem_free + stream_destroy): enqueued
+Cleanup batch flushed: 4 results
+
+=== All tests complete ===
 ```
 
 ## Running Tests
@@ -151,11 +152,8 @@ zlink/
 │   ├── shared_mem.cpp
 │   └── server.cpp
 ├── examples/
-│   ├── cuda/                # CUDA RPC example (client + server)
+│   ├── cuda/                # CUDA RPC example (server + client)
 │   └── libmath/             # Math service example
-├── scripts/                 # Build and test scripts
-│   ├── build_test_pipeline.py
-│   └── cross_host_test.py
 ├── tests/                   # Unit tests
 ├── docs/                    # Documentation
 ├── cmake/                   # CMake modules

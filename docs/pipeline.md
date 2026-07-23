@@ -23,7 +23,7 @@ Every CUDA call is classified by its dependency type:
 ### Implementation: `cuda_pipeline<RpcDef>`
 
 Defined in `include/zlink/cuda_pipeline.hpp`. Template parameter `RpcDef` is the
-zpp_bits RPC binding type (e.g., `cuda_test_rpc`).
+zpp_bits RPC binding type (e.g., `cuda_gen_rpc`).
 
 Key methods:
 
@@ -147,7 +147,7 @@ MyFuncRet my_func(std::uint64_t arg1, int arg2);
 Append to the `zpp::bits::rpc<>` type with the next index number:
 
 ```cpp
-using cuda_test_rpc = zpp::bits::rpc<
+using cuda_gen_rpc = zpp::bits::rpc<
     // ... existing bindings ...
     zpp::bits::bind<&cuda_rpc_api::my_func, 20>,  // Next available index
 >;
@@ -157,19 +157,19 @@ using cuda_test_rpc = zpp::bits::rpc<
 
 ```cpp
 // If it produces a handle → enqueue_produces_handle
-static uint64_t cu_my_func_vh(zlink::cuda_pipeline<cuda_test_rpc>& pipe, ...) {
+static uint64_t cu_my_func_vh(zlink::cuda_pipeline<cuda_gen_rpc>& pipe, ...) {
     uint32_t vh = pipe.enqueue_produces_handle<20>(...);
     return zlink::make_virtual_handle(vh);
 }
 
 // If it only consumes handles → enqueue
-static int32_t cu_my_func(zlink::cuda_pipeline<cuda_test_rpc>& pipe, uint64_t some_vh, ...) {
+static int32_t cu_my_func(zlink::cuda_pipeline<cuda_gen_rpc>& pipe, uint64_t some_vh, ...) {
     pipe.enqueue<20>(some_vh, ...);
     return 0;
 }
 
 // If client needs the result immediately → call_barrier
-static int32_t cu_my_func_barrier(zlink::cuda_pipeline<cuda_test_rpc>& pipe, ...) {
+static int32_t cu_my_func_barrier(zlink::cuda_pipeline<cuda_gen_rpc>& pipe, ...) {
     auto r = pipe.call_barrier<20>(...);
     return r.result;
 }
@@ -188,7 +188,7 @@ Enqueued calls produce deferred results accessible after `flush()`:
 auto results = pipe.flush();
 for (auto& r : results) {
     if (r.valid) {
-        auto typed = pipeline_result_get<cuda_test_rpc, 5, CtxSyncRet>(r);
+        auto typed = pipeline_result_get<cuda_gen_rpc, 5, CtxSyncRet>(r);
         // Use typed.result
     }
 }

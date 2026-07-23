@@ -1,25 +1,30 @@
-// zlink/examples/cuda/cuda_client.cpp
+// zlink/examples/cuda/cuda_client.cpp — CUDA pipeline client with virtual handles
 //
-// CUDA RPC client — Full API with virtual handles.
-// Uses the codegen-generated RPC binding (cuda_gen::cuda_gen_rpc).
-// Function indices use named constants from cuda_gen::func_index.
+// Connects to cuda_server and runs a test workload that exercises:
+//   - barrier calls (cuInit, cuDeviceGetCount, cuDeviceGetAttribute, ...)
+//   - enqueued handle producers (cuCtxCreate, cuMemAlloc, cuStreamCreate)
+//   - enqueued with inline host_sync (cuMemcpyHtoD)
+//   - enqueued handle consumers (cuMemcpyDtoD, cuCtxSynchronize)
+//   - readback (cuMemcpyDtoH — flushes the pipeline + gets data back)
+//
+// The entire Phase-2 batch (alloc + alloc + stream + HtoD + DtoD + sync)
+// is enqueued with virtual handles and flushed in ONE round-trip by the
+// readback call. This is the core zlink performance win.
+//
+// Run: cuda_client [host [port]]
 
 #include <zlink/transport.hpp>
 #include <zlink/tcp_transport.hpp>
-#include <zlink/ptr_map.hpp>
-#include <zlink/memory.hpp>
 #include <zlink/config.hpp>
-#include <zlink/rpc.hpp>
 #include <zlink/cuda_pipeline.hpp>
 #include <zlink/virtual_handle.hpp>
 
-#include "codegen/gen_api.hpp"
+#include "cuda_api.hpp"
 
 #include <zpp_bits.h>
 
 #include <iostream>
 #include <iomanip>
-#include <chrono>
 #include <cstring>
 #include <cstdlib>
 #include <vector>
@@ -28,10 +33,15 @@
 
 using pipe_t = zlink::cuda_pipeline<cuda_gen::cuda_gen_rpc>;
 
-// ── BARRIER WRAPPERS ───────────────────────────────────────────────
+// ── BARRIER WRAPPERS ───────────────────────────────────────────────────
 
 static int32_t cu_init(pipe_t& pipe, unsigned int flags = 0) {
     auto r = pipe.call_barrier<cuda_gen::func_index::init>(flags);
+    return r.result;
+}
+static int32_t cu_driver_get_version(pipe_t& pipe, int& out_ver) {
+    auto r = pipe.call_barrier<cuda_gen::func_index::driver_get_version>();
+    out_ver = r.driverVersion;
     return r.result;
 }
 static int32_t cu_device_get_count(pipe_t& pipe, int& out_count) {
@@ -40,8 +50,8 @@ static int32_t cu_device_get_count(pipe_t& pipe, int& out_count) {
     return r.result;
 }
 static int32_t cu_device_get_name(pipe_t& pipe, int ordinal, std::string& out_name) {
-    auto r = pipe.call_barrier<cuda_gen::func_index::device_get_name>(static_cast<int32_t>(128), ordinal);
-    out_name = r.name;  // Note: codegen returns uint64_t name addr, not string
+    auto r = pipe.call_barrier<cuda_gen::func_index::device_get_name>(128, ordinal);
+    out_name = r.name;
     return r.result;
 }
 static int32_t cu_device_total_mem(pipe_t& pipe, int ordinal, uint64_t& out_bytes) {
@@ -50,13 +60,9 @@ static int32_t cu_device_total_mem(pipe_t& pipe, int ordinal, uint64_t& out_byte
     return r.result;
 }
 static int32_t cu_device_get_attribute(pipe_t& pipe, int attrib, int dev, int32_t& out_value) {
-    auto r = pipe.call_barrier<cuda_gen::func_index::device_get_attribute>(static_cast<uint32_t>(attrib), dev);
+    auto r = pipe.call_barrier<cuda_gen::func_index::device_get_attribute>(
+        static_cast<uint32_t>(attrib), dev);
     out_value = r.value;
-    return r.result;
-}
-static int32_t cu_ctx_get_current(pipe_t& pipe, uint64_t& out_ctx) {
-    auto r = pipe.call_barrier<cuda_gen::func_index::ctx_get_current>();
-    out_ctx = r.ctx_handle;
     return r.result;
 }
 static int32_t cu_mem_get_info(pipe_t& pipe, uint64_t& free_bytes, uint64_t& total_bytes) {
@@ -65,185 +71,72 @@ static int32_t cu_mem_get_info(pipe_t& pipe, uint64_t& free_bytes, uint64_t& tot
     total_bytes = r.total_bytes;
     return r.result;
 }
-static int32_t cu_event_elapsed_time(pipe_t& pipe, uint64_t start_evh, uint64_t end_evh, float& out_ms) {
-    auto r = pipe.call_barrier<cuda_gen::func_index::event_elapsed_time>(start_evh, end_evh);
-    out_ms = r.milliseconds;
-    return r.result;
-}
 
-// ── ENQUEUED WRAPPERS — handle producers ────────────────────────────
+// ── ENQUEUED: handle producers (return virtual handles, no barrier!) ───
 
-// ctx_create → PRODUCES VH(ctx)
 static uint64_t cu_ctx_create(pipe_t& pipe, unsigned int flags, int dev) {
     uint32_t vh = pipe.enqueue_produces_handle<cuda_gen::func_index::ctx_create>(flags, dev);
     return zlink::make_virtual_handle(vh);
 }
-// mem_alloc → PRODUCES VH(dev_ptr) ★ THE KEY WIN
 static uint64_t cu_mem_alloc(pipe_t& pipe, uint64_t size) {
     uint32_t vh = pipe.enqueue_produces_handle<cuda_gen::func_index::mem_alloc>(size);
     return zlink::make_virtual_handle(vh);
 }
-// mem_alloc_managed → PRODUCES VH(dev_ptr)
 static uint64_t cu_mem_alloc_managed(pipe_t& pipe, uint64_t size, unsigned int flags) {
     uint32_t vh = pipe.enqueue_produces_handle<cuda_gen::func_index::mem_alloc_managed>(size, flags);
     return zlink::make_virtual_handle(vh);
 }
-// mem_host_alloc → PRODUCES VH(host_ptr)
-static uint64_t cu_mem_host_alloc(pipe_t& pipe, uint64_t size, unsigned int flags) {
-    uint32_t vh = pipe.enqueue_produces_handle<cuda_gen::func_index::mem_host_alloc>(size, flags);
-    return zlink::make_virtual_handle(vh);
-}
-// module_load_data → PRODUCES VH(module) + inline host_sync
-static uint64_t cu_module_load_data(pipe_t& pipe, const void* image, uint64_t byte_count) {
-    uint32_t vh = pipe.enqueue_produces_handle_with_sync<cuda_gen::func_index::module_load_data>(
-        image, static_cast<std::size_t>(byte_count),
-        static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(image)),
-        byte_count);
-    return zlink::make_virtual_handle(vh);
-}
-// module_load → PRODUCES VH(module) via filename
-static uint64_t cu_module_load(pipe_t& pipe, const std::string& filename) {
-    uint32_t vh = pipe.enqueue_produces_handle<cuda_gen::func_index::module_load>(filename);
-    return zlink::make_virtual_handle(vh);
-}
-// module_get_function → PRODUCES VH(func) + consumes VH(module)
-static uint64_t cu_module_get_function(pipe_t& pipe, uint64_t module_vh, const std::string& name) {
-    uint32_t vh = pipe.enqueue_produces_handle<cuda_gen::func_index::module_get_function>(module_vh, name);
-    return zlink::make_virtual_handle(vh);
-}
-// module_get_global → PRODUCES VH(global_ptr) + consumes VH(module)
-static uint64_t cu_module_get_global(pipe_t& pipe, uint64_t module_vh, const std::string& name) {
-    uint32_t vh = pipe.enqueue_produces_handle<cuda_gen::func_index::module_get_global>(module_vh, name);
-    return zlink::make_virtual_handle(vh);
-}
-// stream_create → PRODUCES VH(stream)
 static uint64_t cu_stream_create(pipe_t& pipe, unsigned int flags = 0) {
     uint32_t vh = pipe.enqueue_produces_handle<cuda_gen::func_index::stream_create>(flags);
     return zlink::make_virtual_handle(vh);
 }
-// event_create → PRODUCES VH(event)
 static uint64_t cu_event_create(pipe_t& pipe, unsigned int flags = 0) {
     uint32_t vh = pipe.enqueue_produces_handle<cuda_gen::func_index::event_create>(flags);
     return zlink::make_virtual_handle(vh);
 }
 
-// ── ENQUEUED WRAPPERS — handle consumers (no VH produced) ───────────
+// ── ENQUEUED: handle consumers ─────────────────────────────────────────
 
-// ctx_destroy — consumes VH(ctx)
-static int32_t cu_ctx_destroy(pipe_t& pipe, uint64_t ctx_vh) {
-    pipe.enqueue<cuda_gen::func_index::ctx_destroy>(ctx_vh);
-    return 0;
-}
-// ctx_set_current — consumes VH(ctx)
-static int32_t cu_ctx_set_current(pipe_t& pipe, uint64_t ctx_vh) {
+static void cu_ctx_set_current(pipe_t& pipe, uint64_t ctx_vh) {
     pipe.enqueue<cuda_gen::func_index::ctx_set_current>(ctx_vh);
-    return 0;
 }
-// ctx_synchronize
-static int32_t cu_ctx_synchronize(pipe_t& pipe) {
+static void cu_ctx_synchronize(pipe_t& pipe) {
     pipe.enqueue<cuda_gen::func_index::ctx_synchronize>();
-    return 0;
 }
-// mem_free — consumes VH(dev_ptr)
-static int32_t cu_mem_free(pipe_t& pipe, uint64_t dev_vh) {
+static void cu_mem_free(pipe_t& pipe, uint64_t dev_vh) {
     pipe.enqueue<cuda_gen::func_index::mem_free>(dev_vh);
-    return 0;
 }
-// mem_free_host — consumes VH(host_ptr)
-static int32_t cu_mem_free_host(pipe_t& pipe, uint64_t host_vh) {
-    pipe.enqueue<cuda_gen::func_index::mem_free_host>(host_vh);
-    return 0;
+static void cu_stream_destroy(pipe_t& pipe, uint64_t stream_vh) {
+    pipe.enqueue<cuda_gen::func_index::stream_destroy>(stream_vh);
 }
-// mem_host_register — consumes host ptr
-static int32_t cu_mem_host_register(pipe_t& pipe, uint64_t host_ptr, uint64_t size, unsigned int flags) {
-    pipe.enqueue<cuda_gen::func_index::mem_host_register>(host_ptr, size, flags);
-    return 0;
+static void cu_event_record(pipe_t& pipe, uint64_t event_vh, uint64_t stream_vh) {
+    pipe.enqueue<cuda_gen::func_index::event_record>(event_vh, stream_vh);
 }
-// mem_host_unregister — consumes host ptr
-static int32_t cu_mem_host_unregister(pipe_t& pipe, uint64_t host_ptr) {
-    pipe.enqueue<cuda_gen::func_index::mem_host_unregister>(host_ptr);
-    return 0;
+static void cu_event_synchronize(pipe_t& pipe, uint64_t event_vh) {
+    pipe.enqueue<cuda_gen::func_index::event_synchronize>(event_vh);
 }
-// memcpy_htod — consumes VH(dev_ptr) + inline host_sync
-static int32_t cu_memcpy_htod(pipe_t& pipe, uint64_t dev_vh,
-                               const void* host_data, uint64_t byte_count) {
+
+// cuMemcpyHtoD: consumes VH(dev_ptr) + inline host_sync (data packed into frame)
+static void cu_memcpy_htod(pipe_t& pipe, uint64_t dev_vh,
+                           const void* host_data, uint64_t byte_count) {
     pipe.enqueue_with_sync<cuda_gen::func_index::memcpy_hto_d>(
         host_data, static_cast<std::size_t>(byte_count),
         dev_vh,
         static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(host_data)),
         byte_count);
-    return 0;
 }
-// memcpy_dtod — consumes VH(dst) + VH(src)
-static int32_t cu_memcpy_dtod(pipe_t& pipe, uint64_t dst_vh, uint64_t src_vh, uint64_t byte_count) {
+
+// cuMemcpyDtoD: consumes VH(dst) + VH(src)
+static void cu_memcpy_dtod(pipe_t& pipe, uint64_t dst_vh, uint64_t src_vh, uint64_t byte_count) {
     pipe.enqueue<cuda_gen::func_index::memcpy_dto_d>(dst_vh, src_vh, byte_count);
-    return 0;
-}
-// memcpy_htod_async — consumes VH(dev_ptr, stream) + inline host_sync
-static int32_t cu_memcpy_htod_async(pipe_t& pipe, uint64_t dev_vh,
-                                     const void* host_data, uint64_t byte_count,
-                                     uint64_t stream_vh) {
-    pipe.enqueue_with_sync<cuda_gen::func_index::memcpy_hto_d_async>(
-        host_data, static_cast<std::size_t>(byte_count),
-        dev_vh,
-        static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(host_data)),
-        byte_count,
-        stream_vh);
-    return 0;
-}
-// module_unload — consumes VH(module)
-static int32_t cu_module_unload(pipe_t& pipe, uint64_t module_vh) {
-    pipe.enqueue<cuda_gen::func_index::module_unload>(module_vh);
-    return 0;
-}
-// launch_kernel — consumes VH(func, stream, args) + inline host_sync
-static int32_t cu_launch_kernel(pipe_t& pipe,
-    uint64_t func_vh,
-    uint32_t grid_x, uint32_t grid_y, uint32_t grid_z,
-    uint32_t block_x, uint32_t block_y, uint32_t block_z,
-    uint32_t shared_mem, uint64_t stream_vh,
-    const void* args, uint64_t args_size) {
-    pipe.enqueue_with_sync<cuda_gen::func_index::launch_kernel>(
-        args, static_cast<std::size_t>(args_size),
-        func_vh,
-        grid_x, grid_y, grid_z,
-        block_x, block_y, block_z,
-        shared_mem, stream_vh,
-        static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(args)),
-        args_size);
-    return 0;
-}
-// stream_destroy — consumes VH(stream)
-static int32_t cu_stream_destroy(pipe_t& pipe, uint64_t stream_vh) {
-    pipe.enqueue<cuda_gen::func_index::stream_destroy>(stream_vh);
-    return 0;
-}
-// stream_synchronize — consumes VH(stream)
-static int32_t cu_stream_synchronize(pipe_t& pipe, uint64_t stream_vh) {
-    pipe.enqueue<cuda_gen::func_index::stream_synchronize>(stream_vh);
-    return 0;
-}
-// event_destroy — consumes VH(event)
-static int32_t cu_event_destroy(pipe_t& pipe, uint64_t event_vh) {
-    pipe.enqueue<cuda_gen::func_index::event_destroy>(event_vh);
-    return 0;
-}
-// event_record — consumes VH(event, stream)
-static int32_t cu_event_record(pipe_t& pipe, uint64_t event_vh, uint64_t stream_vh) {
-    pipe.enqueue<cuda_gen::func_index::event_record>(event_vh, stream_vh);
-    return 0;
-}
-// event_synchronize — consumes VH(event)
-static int32_t cu_event_synchronize(pipe_t& pipe, uint64_t event_vh) {
-    pipe.enqueue<cuda_gen::func_index::event_synchronize>(event_vh);
-    return 0;
 }
 
-// ── READBACK WRAPPERS (indices 19, 22) ──────────────────────────────
-
-// memcpy_dtoh — READBACK + consumes VH(src_dev_ptr)
+// ── READBACK: cuMemcpyDtoH (flushes pipeline + gets data back) ──────────
+// The host_sync creates the mirror region; the RPC runs the DtoH on the
+// server (copies GPU→mirror); the host_read pulls mirror data back to the
+// client. All packed into one pipeline_mem round-trip.
 static int32_t cu_memcpy_dtoh(pipe_t& pipe, void* host_data,
-                               uint64_t dev_vh, uint64_t byte_count) {
+                              uint64_t dev_vh, uint64_t byte_count) {
     auto results = pipe.call_readback_with_sync_read<cuda_gen::func_index::memcpy_dto_h>(
         host_data, static_cast<std::size_t>(byte_count),
         static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(host_data)),
@@ -261,31 +154,16 @@ static int32_t cu_memcpy_dtoh(pipe_t& pipe, void* host_data,
     return -1;
 }
 
-// memcpy_dtoh_async — READBACK + consumes VH(src_dev_ptr, stream)
-static int32_t cu_memcpy_dtoh_async(pipe_t& pipe, void* host_data,
-                                      uint64_t dev_vh, uint64_t byte_count,
-                                      uint64_t stream_vh) {
-    auto results = pipe.call_readback_with_sync_read<cuda_gen::func_index::memcpy_dto_h_async>(
-        host_data, static_cast<std::size_t>(byte_count),
-        static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(host_data)),
-        dev_vh,
-        byte_count,
-        stream_vh);
-
-    if (!results.empty() && results.back().valid) {
-        using namespace zpp::bits;
-        auto [data, in, out] = data_in_out();
-        data.assign(results.back().data.begin(), results.back().data.end());
-        cuda_gen::cuda_gen_rpc::client client{in, out};
-        auto r = client.template response<cuda_gen::func_index::memcpy_dto_h_async>().or_throw();
-        return r.result;
-    }
-    return -1;
+// ── BARRIER: cuEventElapsedTime (needs the float value) ─────────────────
+static int32_t cu_event_elapsed_time(pipe_t& pipe, uint64_t start_evh, uint64_t end_evh, float& out_ms) {
+    auto r = pipe.call_barrier<cuda_gen::func_index::event_elapsed_time>(start_evh, end_evh);
+    out_ms = r.milliseconds;
+    return r.result;
 }
 
-// ══════════════════════════════════════════════════════════════════════
-// TEST
-// ══════════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════
+// TEST WORKLOAD
+// ══════════════════════════════════════════════════════════════════════════
 int main(int argc, char* argv[]) {
     std::string host = "127.0.0.1";
     std::uint16_t port = zlink::default_port;
@@ -294,22 +172,21 @@ int main(int argc, char* argv[]) {
 
     auto tp = zlink::make_transport(zlink::transport_kind::tcp);
     std::cout << "Connecting to " << host << ":" << port << "...\n";
-
     auto ec = tp->connect(host, port);
-    if (ec) {
-        std::cerr << "Failed to connect: " << ec.message() << "\n";
-        return 1;
-    }
+    if (ec) { std::cerr << "connect failed: " << ec.message() << "\n"; return 1; }
     std::cout << "Connected!\n\n";
 
     pipe_t pipe(*tp);
 
-    // ── Phase 1: Setup (barrier calls) ───────────────────────────────
-    std::cout << "=== Phase 1: Setup (barriers) ===" << std::endl;
-
+    // ── Phase 1: Setup (barrier calls) ────────────────────────────────
+    std::cout << "=== Phase 1: Setup (barriers) ===\n";
     int32_t res = cu_init(pipe, 0);
     std::cout << "cuInit: " << res << (res == 0 ? " OK" : " FAIL") << "\n";
     if (res != 0) return 1;
+
+    int drv_ver = 0;
+    cu_driver_get_version(pipe, drv_ver);
+    std::cout << "Driver version: " << drv_ver << "\n";
 
     int dev_count = 0;
     cu_device_get_count(pipe, dev_count);
@@ -321,29 +198,29 @@ int main(int argc, char* argv[]) {
 
     uint64_t total_mem = 0;
     cu_device_total_mem(pipe, 0, total_mem);
-    std::cout << "Total memory: " << (total_mem / (1024*1024)) << " MB\n";
+    std::cout << "Total memory: " << (total_mem / (1024 * 1024)) << " MB\n";
 
     int32_t warp_size = 0;
     cu_device_get_attribute(pipe, 4 /*CU_DEVICE_ATTRIBUTE_WARP_SIZE*/, 0, warp_size);
     std::cout << "Warp size: " << warp_size << "\n";
 
-    uint64_t free_mem = 0, total_available = 0;
-    cu_mem_get_info(pipe, free_mem, total_available);
-    std::cout << "Free memory: " << (free_mem / (1024*1024)) << " MB / "
-              << (total_available / (1024*1024)) << " MB\n";
+    uint64_t free_mem = 0, total_avail = 0;
+    cu_mem_get_info(pipe, free_mem, total_avail);
+    std::cout << "Free memory: " << (free_mem / (1024 * 1024)) << " MB / "
+              << (total_avail / (1024 * 1024)) << " MB\n";
 
-    // ── Phase 2: Virtual handle pipeline ─────────────────────────────
-    std::cout << "\n=== Phase 2: Virtual Handle Pipeline ===" << std::endl;
+    // ── Phase 2: Virtual-handle pipeline (the key win!) ──────────────
+    std::cout << "\n=== Phase 2: Virtual Handle Pipeline ===\n";
     std::cout << "ALL calls enqueued — NO barriers between alloc/HtoD/sync!\n\n";
 
     uint64_t ctx_vh = cu_ctx_create(pipe, 0u, 0);
     std::cout << "cuCtxCreate: VH(" << zlink::virtual_handle_id(ctx_vh) << ") — enqueued\n";
 
     const std::size_t buf_size = 256;
-    uint64_t dev_ptr_vh = cu_mem_alloc(pipe, static_cast<uint64_t>(buf_size));
-    std::cout << "cuMemAlloc: VH(" << zlink::virtual_handle_id(dev_ptr_vh) << ") — enqueued\n";
+    uint64_t dev_ptr_vh = cu_mem_alloc(pipe, buf_size);
+    std::cout << "cuMemAlloc:  VH(" << zlink::virtual_handle_id(dev_ptr_vh) << ") — enqueued\n";
 
-    uint64_t dev_ptr2_vh = cu_mem_alloc(pipe, static_cast<uint64_t>(buf_size));
+    uint64_t dev_ptr2_vh = cu_mem_alloc(pipe, buf_size);
     std::cout << "cuMemAlloc(2): VH(" << zlink::virtual_handle_id(dev_ptr2_vh) << ") — enqueued\n";
 
     uint64_t stream_vh = cu_stream_create(pipe, 0);
@@ -354,25 +231,27 @@ int main(int argc, char* argv[]) {
         host_data[i] = static_cast<float>(i) * 1.5f;
     }
 
-    cu_memcpy_htod(pipe, dev_ptr_vh, host_data.data(), static_cast<uint64_t>(buf_size));
-    std::cout << "cuMemcpyHtoD(VH(" << zlink::virtual_handle_id(dev_ptr_vh) << ")): enqueued\n";
+    cu_memcpy_htod(pipe, dev_ptr_vh, host_data.data(), buf_size);
+    std::cout << "cuMemcpyHtoD(VH(" << zlink::virtual_handle_id(dev_ptr_vh)
+              << ")): enqueued (inline sync)\n";
 
-    cu_memcpy_dtod(pipe, dev_ptr2_vh, dev_ptr_vh, static_cast<uint64_t>(buf_size));
+    cu_memcpy_dtod(pipe, dev_ptr2_vh, dev_ptr_vh, buf_size);
     std::cout << "cuMemcpyDtoD: enqueued\n";
 
     cu_ctx_synchronize(pipe);
     std::cout << "cuCtxSynchronize: enqueued\n";
 
-    // cuMemcpyDtoH — READBACK: flush pipeline + get data back
-    std::cout << "\n=== cuMemcpyDtoH: READBACK — flushing pipeline ===" << std::endl;
-
+    // cuMemcpyDtoH — READBACK: this flushes the ENTIRE batch above
+    // (ctx_create + 2×alloc + stream + HtoD + DtoD + sync) in ONE round-trip,
+    // then reads the data back.
+    std::cout << "\n=== cuMemcpyDtoH: READBACK — flushing pipeline ===\n";
     std::vector<float> readback(buf_size / sizeof(float), 0.0f);
-    res = cu_memcpy_dtoh(pipe, readback.data(), dev_ptr2_vh, static_cast<uint64_t>(buf_size));
+    res = cu_memcpy_dtoh(pipe, readback.data(), dev_ptr2_vh, buf_size);
     std::cout << "cuMemcpyDtoH result: " << res
               << (res == 0 ? " (SUCCESS)" : " (FAILED)") << "\n";
 
     if (res == 0) {
-        std::cout << "\n=== Data Verification (DtoD round-trip) ===" << std::endl;
+        std::cout << "\n=== Data Verification (DtoD round-trip) ===\n";
         bool match = true;
         int mismatches = 0;
         for (size_t i = 0; i < host_data.size(); i++) {
@@ -387,111 +266,79 @@ int main(int argc, char* argv[]) {
         }
         if (match) {
             std::cout << "  All " << host_data.size() << " values match!\n";
-            std::cout << "  VH pipeline verified: alloc+alloc+stream+HtoD+DtoD+sync+DtoH in 1 round-trip!\n";
+            std::cout << "  VH pipeline verified: alloc+alloc+stream+HtoD+DtoD+sync+DtoH"
+                      << " in 1 round-trip!\n";
         } else {
-            std::cout << "  " << mismatches << " mismatches out of " << host_data.size() << " values\n";
+            std::cout << "  " << mismatches << " mismatches out of "
+                      << host_data.size() << " values\n";
         }
     }
 
     // ── Phase 3: Event pipeline ──────────────────────────────────────
-    std::cout << "\n=== Phase 3: Event Pipeline Test ===" << std::endl;
+    std::cout << "\n=== Phase 3: Event Pipeline Test ===\n";
 
     uint64_t start_event_vh = cu_event_create(pipe, 0);
     uint64_t end_event_vh = cu_event_create(pipe, 0);
-    std::cout << "Events created: start=VH(" << zlink::virtual_handle_id(start_event_vh)
-              << "), end=VH(" << zlink::virtual_handle_id(end_event_vh) << ")\n";
+    std::cout << "cuEventCreate x2: VH(" << zlink::virtual_handle_id(start_event_vh)
+              << "), VH(" << zlink::virtual_handle_id(end_event_vh) << ") — enqueued\n";
 
     cu_event_record(pipe, start_event_vh, stream_vh);
+    std::cout << "cuEventRecord(start): enqueued\n";
+
     cu_event_record(pipe, end_event_vh, stream_vh);
-    cu_stream_synchronize(pipe, stream_vh);
+    std::cout << "cuEventRecord(end): enqueued\n";
+
     cu_event_synchronize(pipe, end_event_vh);
+    std::cout << "cuEventSynchronize(end): enqueued\n";
 
+    // Flush the event batch
     auto event_results = pipe.flush();
-    std::cout << "Event pipeline flush: " << event_results.size() << " results\n";
+    std::cout << "Event batch flushed: " << event_results.size() << " results\n";
 
+    // cuEventElapsedTime is a barrier (needs the float value)
     float elapsed_ms = 0.0f;
     res = cu_event_elapsed_time(pipe, start_event_vh, end_event_vh, elapsed_ms);
-    std::cout << "EventElapsedTime: " << elapsed_ms << " ms (result=" << res << ")\n";
+    std::cout << "cuEventElapsedTime: " << res
+              << (res == 0 ? " OK" : " FAIL")
+              << ", " << elapsed_ms << " ms\n";
 
-    cu_event_destroy(pipe, start_event_vh);
-    cu_event_destroy(pipe, end_event_vh);
+    // ── Phase 4: Managed memory + cleanup ────────────────────────────
+    std::cout << "\n=== Phase 4: Managed Memory + Cleanup ===\n";
 
-    // ── Cleanup ──────────────────────────────────────────────────────
+    uint64_t managed_vh = cu_mem_alloc_managed(pipe, buf_size, 1 /*CU_MEM_ATTACH_GLOBAL*/);
+    std::cout << "cuMemAllocManaged: VH(" << zlink::virtual_handle_id(managed_vh)
+              << ") — enqueued\n";
+
+    // Copy into managed memory, read back to verify
+    cu_memcpy_htod(pipe, managed_vh, host_data.data(), buf_size);
+    cu_ctx_synchronize(pipe);
+    std::cout << "cuMemcpyHtoD(managed) + cuCtxSynchronize: enqueued\n";
+
+    std::vector<float> managed_readback(buf_size / sizeof(float), 0.0f);
+    res = cu_memcpy_dtoh(pipe, managed_readback.data(), managed_vh, buf_size);
+    std::cout << "cuMemcpyDtoH(managed) result: " << res
+              << (res == 0 ? " (SUCCESS)" : " (FAILED)") << "\n";
+
+    if (res == 0) {
+        bool match = true;
+        for (size_t i = 0; i < host_data.size(); i++) {
+            if (std::abs(managed_readback[i] - host_data[i]) > 1e-6f) { match = false; break; }
+        }
+        std::cout << "  Managed memory round-trip: "
+                  << (match ? "VERIFIED" : "MISMATCH") << "\n";
+    }
+
+    // Cleanup: enqueue frees, then flush
     cu_mem_free(pipe, dev_ptr_vh);
     cu_mem_free(pipe, dev_ptr2_vh);
+    cu_mem_free(pipe, managed_vh);
     cu_stream_destroy(pipe, stream_vh);
-    cu_ctx_destroy(pipe, ctx_vh);
-    std::cout << "\nCleanup enqueued\n";
+    std::cout << "Cleanup (3×mem_free + stream_destroy): enqueued\n";
 
     auto final_results = pipe.flush();
-    std::cout << "Final flush: " << final_results.size() << " deferred calls\n";
+    std::cout << "Cleanup batch flushed: " << final_results.size() << " results\n";
 
-    // ── Benchmark ────────────────────────────────────────────────────
-    std::cout << "\n=== Benchmark: Virtual Handles vs Barriers ===" << std::endl;
-
-    auto t_vh_start = std::chrono::high_resolution_clock::now();
-    {
-        pipe_t vh_pipe(*tp);
-        uint64_t vh_ctx = cu_ctx_create(vh_pipe, 0u, 0);
-        uint64_t vh_ptr = cu_mem_alloc(vh_pipe, buf_size);
-        uint64_t vh_ptr2 = cu_mem_alloc(vh_pipe, buf_size);
-        uint64_t vh_stream = cu_stream_create(vh_pipe, 0);
-
-        std::vector<float> bench_data(buf_size / sizeof(float), 3.14f);
-        cu_memcpy_htod(vh_pipe, vh_ptr, bench_data.data(), buf_size);
-        cu_memcpy_dtod(vh_pipe, vh_ptr2, vh_ptr, buf_size);
-        cu_ctx_synchronize(vh_pipe);
-
-        std::vector<float> bench_read(buf_size / sizeof(float), 0.0f);
-        cu_memcpy_dtoh(vh_pipe, bench_read.data(), vh_ptr2, buf_size);
-
-        cu_mem_free(vh_pipe, vh_ptr);
-        cu_mem_free(vh_pipe, vh_ptr2);
-        cu_stream_destroy(vh_pipe, vh_stream);
-        cu_ctx_destroy(vh_pipe, vh_ctx);
-        vh_pipe.flush();
-    }
-    auto t_vh_end = std::chrono::high_resolution_clock::now();
-    auto vh_us = std::chrono::duration_cast<std::chrono::microseconds>(t_vh_end - t_vh_start).count();
-
-    auto t_barrier_start = std::chrono::high_resolution_clock::now();
-    {
-        pipe_t bar_pipe(*tp);
-        auto r1 = bar_pipe.call_barrier<cuda_gen::func_index::ctx_create>(0u, 0);
-        uint64_t real_ctx = r1.ctx_handle;
-        auto r2 = bar_pipe.call_barrier<cuda_gen::func_index::mem_alloc>(static_cast<uint64_t>(buf_size));
-        uint64_t real_ptr = r2.dev_ptr;
-        auto r3 = bar_pipe.call_barrier<cuda_gen::func_index::mem_alloc>(static_cast<uint64_t>(buf_size));
-        uint64_t real_ptr2 = r3.dev_ptr;
-
-        std::vector<float> bench_data(buf_size / sizeof(float), 3.14f);
-        bar_pipe.enqueue_with_sync<cuda_gen::func_index::memcpy_hto_d>(
-            bench_data.data(), buf_size,
-            real_ptr,
-            reinterpret_cast<std::uint64_t>(bench_data.data()),
-            buf_size);
-        bar_pipe.enqueue<cuda_gen::func_index::memcpy_dto_d>(real_ptr2, real_ptr, buf_size);
-        bar_pipe.enqueue<cuda_gen::func_index::ctx_synchronize>();
-
-        std::vector<float> bench_read(buf_size / sizeof(float), 0.0f);
-        bar_pipe.call_readback_with_sync_read<cuda_gen::func_index::memcpy_dto_h>(
-            bench_read.data(), buf_size,
-            reinterpret_cast<std::uint64_t>(bench_read.data()),
-            real_ptr2,
-            buf_size);
-
-        bar_pipe.enqueue<cuda_gen::func_index::mem_free>(real_ptr);
-        bar_pipe.enqueue<cuda_gen::func_index::mem_free>(real_ptr2);
-        bar_pipe.enqueue<cuda_gen::func_index::ctx_destroy>(real_ctx);
-        bar_pipe.flush();
-    }
-    auto t_barrier_end = std::chrono::high_resolution_clock::now();
-    auto barrier_us = std::chrono::duration_cast<std::chrono::microseconds>(t_barrier_end - t_barrier_start).count();
-
-    std::cout << "  Virtual handles (1-2 round-trips):  " << vh_us << " us\n"
-              << "  Barrier style (4+ round-trips):     " << barrier_us << " us\n"
-              << "  Speedup: " << (barrier_us > 0 ? static_cast<double>(barrier_us) / vh_us : 0.0) << "x\n";
-
+    std::cout << "\n=== All tests complete ===\n";
     tp->close();
     return 0;
 }

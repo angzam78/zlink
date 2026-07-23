@@ -163,7 +163,7 @@ Instead, each CUDA wrapper function on the server side sets a global variable
 `g_last_produced_handle` after calling the real CUDA function:
 
 ```cpp
-// In cuda_test_server.cpp:
+// In cuda_server.cpp:
 CUdeviceptr real_ptr;
 CUresult res = cuMemAlloc(&real_ptr, bytesize);
 g_last_produced_handle = static_cast<uint64_t>(real_ptr);

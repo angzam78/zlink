@@ -2,7 +2,9 @@
 
 > **Status: Not yet tested.** This document describes the planned approach
 > for running PyTorch workloads (like Stable Diffusion 1.5) over zlink.
-> It will be updated after actual testing.
+> The current CUDA example (`examples/cuda/cuda_client.cpp`) demonstrates the
+> pipeline client API directly. The LD_PRELOAD shim described here is a
+> future extension that will use the same pipeline + virtual handle layer.
 
 ## Goal
 

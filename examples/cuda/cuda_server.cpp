@@ -1,385 +1,630 @@
-// zlink/examples/cuda/cuda_server.cpp
+// zlink/examples/cuda/cuda_server.cpp — CUDA RPC server over the zlink pipeline
 //
-// CUDA RPC server — comprehensive coverage via codegen.
+// Runs on the GPU machine. Receives RPC calls (plain + batched) from the
+// client, executes them on real CUDA hardware, and sends responses back.
 //
-// Handles all CUDA Driver API functions from gen_api.hpp,
-// including the generated handlers from gen_server.inc.
-//
-// Runs on the GPU machine. Receives RPC calls from the client shim
-// and executes them on real CUDA hardware.
-//
-// KEY DESIGN (functionally equivalent to Lupine's server):
-//   - gen_api.hpp defines the RPC structs and function bindings
-//   - gen_server.inc contains the handler function bodies (cuda_gen namespace)
-//   - zpp::bits server.serve() dispatches to bound handlers automatically
-//   - Special functions (cuLaunchKernel, cuGetProcAddress) override generated
-//     handlers with hand-written implementations
-//   - Client and server always use the same zlink build (no protocol versioning)
-//   - Single client connection (fork-per-client like Lupine can be added later)
-//   - Memory ops (host_sync, host_read) handled alongside RPC requests
+// Key components:
+//   - cuda_gen::* handlers: real CUDA calls; handle producers set
+//     g_last_produced_handle via an RAII guard; handle consumers translate
+//     virtual handles via g_vhandles.
+//   - handle_pipeline_mem(): the core batching path. Parses the handle
+//     manifest BEFORE running RPCs (so handles register under their virtual_id
+//     immediately), applies host sync data (LZ4), runs the RPCs in order, and
+//     packs read data back (LZ4) into a single response frame.
 
 #include <zlink/transport.hpp>
 #include <zlink/tcp_transport.hpp>
-#include <zlink/ptr_map.hpp>
-#include <zlink/memory.hpp>
-#include <zlink/chunk_cache.hpp>
 #include <zlink/config.hpp>
 #include <zlink/virtual_handle.hpp>
+#include <zlink/compress.hpp>
+#include <zlink/memory.hpp>
 
-#include "codegen/gen_api.hpp"
+#include "cuda_api.hpp"
 
 #include <zpp_bits.h>
 
 #include <cuda.h>
+
 #include <iostream>
 #include <cstring>
 #include <cstdlib>
 #include <vector>
 #include <string>
-#include <unordered_map>
+#include <span>
 #include <mutex>
+#include <unordered_map>
 
-// ── Global state ──────────────────────────────────────────────────────
-static zlink::ptr_map g_ptr_map;
-static zlink::host_memory_mirror g_host_mirror;
-static zlink::handle_table g_vhandles;
+// ── Server global state ────────────────────────────────────────────────
+static zlink::handle_table g_vhandles;          // virtual → real handle map
+static zlink::host_memory_mirror g_host_mirror;  // client host memory on server
 
-// ── Handle production hook ─────────────────────────────────────────────
+// Handle production capture: producing handlers set g_last_produced_handle.
+// After serve(), the pipeline handler reads it to register VH→real.
 static std::uint64_t g_last_produced_handle = 0;
 static bool g_has_produced_handle = false;
 
-// ══════════════════════════════════════════════════════════════════════════
-// HAND-WRITTEN SPECIAL HANDLERS
-// ══════════════════════════════════════════════════════════════════════════
-// These override the generated handlers for functions that need complex
-// server-side logic (argument translation, pointer dereferencing, etc.)
+// RAII guard: set g_last_produced_handle + g_has_produced_handle on success.
+struct handle_producer_guard {
+    bool produced = false;
+    ~handle_producer_guard() { if (produced) g_has_produced_handle = true; }
+    void set(std::uint64_t real_handle) {
+        g_last_produced_handle = real_handle;
+        produced = true;
+    }
+};
 
-// ── cuGetProcAddress server-side override ────────────────────────────────
-// This overrides the generated cuda_gen::get_proc_address handler because
-// we need to resolve symbols in the real CUDA driver on this server.
 namespace cuda_gen {
 
-GetProcAddressRet get_proc_address(std::string symbol_name, int32_t cuda_version, std::uint64_t flags) {
-    GetProcAddressRet ret;
-    ret.result = CUDA_ERROR_NOT_FOUND;
-    ret.func_ptr = 0;
-
-    void* real_fn = nullptr;
-    CUresult res = cuGetProcAddress(symbol_name.c_str(), &real_fn,
-                                     cuda_version, flags, nullptr);
-    if (res == CUDA_SUCCESS && real_fn != nullptr) {
-        ret.result = CUDA_SUCCESS;
-        ret.func_ptr = reinterpret_cast<std::uint64_t>(real_fn);
-        g_has_produced_handle = true;
-    }
-
+// ── barrier handlers ───────────────────────────────────────────────────
+InitRet init(uint32_t flags) {
+    InitRet ret;
+    ret.result = static_cast<int32_t>(cuInit(flags));
     return ret;
 }
+DriverGetVersionRet driver_get_version() {
+    int v = 0;
+    CUresult r = cuDriverGetVersion(&v);
+    return {static_cast<int32_t>(r), v};
+}
+DeviceGetCountRet device_get_count() {
+    int c = 0;
+    CUresult r = cuDeviceGetCount(&c);
+    return {static_cast<int32_t>(r), c};
+}
+DeviceGetRet device_get(int32_t ordinal) {
+    CUdevice d = 0;
+    CUresult r = cuDeviceGet(&d, ordinal);
+    return {static_cast<int32_t>(r), static_cast<int32_t>(d)};
+}
+DeviceGetNameRet device_get_name(int32_t len, int32_t dev) {
+    char name[256] = {};
+    CUresult r = cuDeviceGetName(name, len, static_cast<CUdevice>(dev));
+    return {static_cast<int32_t>(r), std::string(name)};
+}
+DeviceTotalMemRet device_total_mem(int32_t dev) {
+    size_t b = 0;
+    CUresult r = cuDeviceTotalMem(&b, static_cast<CUdevice>(dev));
+    return {static_cast<int32_t>(r), static_cast<uint64_t>(b)};
+}
+DeviceGetAttributeRet device_get_attribute(uint32_t attrib, int32_t dev) {
+    int v = 0;
+    CUresult r = cuDeviceGetAttribute(&v,
+        static_cast<CUdevice_attribute>(attrib), static_cast<CUdevice>(dev));
+    return {static_cast<int32_t>(r), v};
+}
+CtxGetCurrentRet ctx_get_current() {
+    CUcontext ctx = nullptr;
+    CUresult r = cuCtxGetCurrent(&ctx);
+    return {static_cast<int32_t>(r), reinterpret_cast<uint64_t>(ctx)};
+}
+MemGetInfoRet mem_get_info() {
+    size_t free_b = 0, total_b = 0;
+    CUresult r = cuMemGetInfo(&free_b, &total_b);
+    return {static_cast<int32_t>(r), static_cast<uint64_t>(free_b),
+            static_cast<uint64_t>(total_b)};
+}
+EventElapsedTimeRet event_elapsed_time(uint64_t start_handle, uint64_t end_handle) {
+    CUevent s = reinterpret_cast<CUevent>(g_vhandles.translate(start_handle));
+    CUevent e = reinterpret_cast<CUevent>(g_vhandles.translate(end_handle));
+    float ms = 0.0f;
+    CUresult r = cuEventElapsedTime(&ms, s, e);
+    return {static_cast<int32_t>(r), ms};
+}
 
-// ── cuLaunchKernel server-side override ──────────────────────────────────
-// This overrides the generated cuda_gen::launch_kernel handler because
-// we need to translate handles, dereference kernel args from host mirror,
-// and pass them as void** to the real cuLaunchKernel.
-LaunchKernelRet launch_kernel(std::uint64_t func_handle,
-                               std::uint32_t grid_dim_x, std::uint32_t grid_dim_y, std::uint32_t grid_dim_z,
-                               std::uint32_t block_dim_x, std::uint32_t block_dim_y, std::uint32_t block_dim_z,
-                               std::uint32_t shared_mem_bytes,
-                               std::uint64_t stream_handle,
-                               std::uint64_t args_client_addr,
-                               std::uint64_t args_byte_count) {
+// ── enqueued handle producers ──────────────────────────────────────────
+CtxCreateRet ctx_create(uint32_t flags, int32_t dev) {
+    handle_producer_guard guard;
+    CUcontext ctx = nullptr;
+    CUresult r = cuCtxCreate(&ctx, flags, static_cast<CUdevice>(dev));
+    if (r == CUDA_SUCCESS) guard.set(reinterpret_cast<uint64_t>(ctx));
+    return {static_cast<int32_t>(r), reinterpret_cast<uint64_t>(ctx)};
+}
+MemAllocRet mem_alloc(uint64_t bytesize) {
+    handle_producer_guard guard;
+    CUdeviceptr p = 0;
+    CUresult r = cuMemAlloc(&p, static_cast<size_t>(bytesize));
+    if (r == CUDA_SUCCESS) guard.set(static_cast<uint64_t>(p));
+    return {static_cast<int32_t>(r), static_cast<uint64_t>(p)};
+}
+MemAllocManagedRet mem_alloc_managed(uint64_t bytesize, uint32_t flags) {
+    handle_producer_guard guard;
+    CUdeviceptr p = 0;
+    CUresult r = cuMemAllocManaged(&p, static_cast<size_t>(bytesize), flags);
+    if (r == CUDA_SUCCESS) guard.set(static_cast<uint64_t>(p));
+    return {static_cast<int32_t>(r), static_cast<uint64_t>(p)};
+}
+StreamCreateRet stream_create(uint32_t flags) {
+    handle_producer_guard guard;
+    CUstream s = nullptr;
+    CUresult r = cuStreamCreate(&s, flags);
+    if (r == CUDA_SUCCESS) guard.set(reinterpret_cast<uint64_t>(s));
+    return {static_cast<int32_t>(r), reinterpret_cast<uint64_t>(s)};
+}
+EventCreateRet event_create(uint32_t flags) {
+    handle_producer_guard guard;
+    CUevent e = nullptr;
+    CUresult r = cuEventCreate(&e, flags);
+    if (r == CUDA_SUCCESS) guard.set(reinterpret_cast<uint64_t>(e));
+    return {static_cast<int32_t>(r), reinterpret_cast<uint64_t>(e)};
+}
+ModuleLoadDataRet module_load_data(uint64_t image_addr, uint64_t byte_count) {
+    handle_producer_guard guard;
+    CUmodule mod = nullptr;
+    void* image = nullptr;
+    auto mirror = g_host_mirror.translate(static_cast<std::uintptr_t>(image_addr));
+    if (mirror) image = reinterpret_cast<void*>(*mirror);
+    CUresult r = (image) ? cuModuleLoadData(&mod, image)
+                         : static_cast<CUresult>(CUDA_ERROR_INVALID_VALUE);
+    if (r == CUDA_SUCCESS) guard.set(reinterpret_cast<uint64_t>(mod));
+    return {static_cast<int32_t>(r), reinterpret_cast<uint64_t>(mod)};
+}
+ModuleGetFunctionRet module_get_function(uint64_t module_handle, std::string name) {
+    handle_producer_guard guard;
+    CUmodule mod = reinterpret_cast<CUmodule>(g_vhandles.translate(module_handle));
+    CUfunction fn = nullptr;
+    CUresult r = cuModuleGetFunction(&fn, mod, name.c_str());
+    if (r == CUDA_SUCCESS) guard.set(reinterpret_cast<uint64_t>(fn));
+    return {static_cast<int32_t>(r), reinterpret_cast<uint64_t>(fn)};
+}
 
-    LaunchKernelRet ret;
+// ── enqueued handle consumers ──────────────────────────────────────────
+CtxDestroyRet ctx_destroy(uint64_t ctx_handle) {
+    CUcontext ctx = reinterpret_cast<CUcontext>(g_vhandles.translate(ctx_handle));
+    return {static_cast<int32_t>(cuCtxDestroy(ctx))};
+}
+CtxSetCurrentRet ctx_set_current(uint64_t ctx_handle) {
+    CUcontext ctx = reinterpret_cast<CUcontext>(g_vhandles.translate(ctx_handle));
+    return {static_cast<int32_t>(cuCtxSetCurrent(ctx))};
+}
+CtxSynchronizeRet ctx_synchronize() {
+    return {static_cast<int32_t>(cuCtxSynchronize())};
+}
+MemFreeRet mem_free(uint64_t dptr) {
+    CUdeviceptr p = static_cast<CUdeviceptr>(g_vhandles.translate(dptr));
+    return {static_cast<int32_t>(cuMemFree(p))};
+}
+MemcpyHtoDRet memcpy_hto_d(uint64_t dst_device, uint64_t src_host_addr, uint64_t byte_count) {
+    CUdeviceptr dst = static_cast<CUdeviceptr>(g_vhandles.translate(dst_device));
+    void* src = nullptr;
+    auto mirror = g_host_mirror.translate(static_cast<std::uintptr_t>(src_host_addr));
+    if (mirror) src = reinterpret_cast<void*>(*mirror);
+    CUresult r = src ? cuMemcpyHtoD(dst, src, static_cast<size_t>(byte_count))
+                     : static_cast<CUresult>(CUDA_ERROR_INVALID_VALUE);
+    return {static_cast<int32_t>(r)};
+}
+MemcpyDtoDRet memcpy_dto_d(uint64_t dst_device, uint64_t src_device, uint64_t byte_count) {
+    CUdeviceptr dst = static_cast<CUdeviceptr>(g_vhandles.translate(dst_device));
+    CUdeviceptr src = static_cast<CUdeviceptr>(g_vhandles.translate(src_device));
+    return {static_cast<int32_t>(cuMemcpyDtoD(dst, src, static_cast<size_t>(byte_count)))};
+}
+// readback: cuMemcpyDtoH — copy from GPU device to the mirrored client host
+// memory. The client later pulls the bytes back via the host_read in the
+// pipeline_mem response.
+MemcpyDtoHRet memcpy_dto_h(uint64_t dst_host_addr, uint64_t src_device, uint64_t byte_count) {
+    CUdeviceptr src = static_cast<CUdeviceptr>(g_vhandles.translate(src_device));
+    void* dst = nullptr;
+    auto mirror = g_host_mirror.translate(static_cast<std::uintptr_t>(dst_host_addr));
+    if (mirror) dst = reinterpret_cast<void*>(*mirror);
+    CUresult r = dst ? cuMemcpyDtoH(dst, src, static_cast<size_t>(byte_count))
+                     : static_cast<CUresult>(CUDA_ERROR_INVALID_VALUE);
+    return {static_cast<int32_t>(r)};
+}
+StreamDestroyRet stream_destroy(uint64_t stream_handle) {
+    CUstream s = reinterpret_cast<CUstream>(g_vhandles.translate(stream_handle));
+    return {static_cast<int32_t>(cuStreamDestroy(s))};
+}
+StreamSynchronizeRet stream_synchronize(uint64_t stream_handle) {
+    CUstream s = reinterpret_cast<CUstream>(g_vhandles.translate(stream_handle));
+    return {static_cast<int32_t>(cuStreamSynchronize(s))};
+}
+EventDestroyRet event_destroy(uint64_t event_handle) {
+    CUevent e = reinterpret_cast<CUevent>(g_vhandles.translate(event_handle));
+    return {static_cast<int32_t>(cuEventDestroy(e))};
+}
+EventRecordRet event_record(uint64_t event_handle, uint64_t stream_handle) {
+    CUevent e = reinterpret_cast<CUevent>(g_vhandles.translate(event_handle));
+    CUstream s = reinterpret_cast<CUstream>(g_vhandles.translate(stream_handle));
+    return {static_cast<int32_t>(cuEventRecord(e, s))};
+}
+EventSynchronizeRet event_synchronize(uint64_t event_handle) {
+    CUevent e = reinterpret_cast<CUevent>(g_vhandles.translate(event_handle));
+    return {static_cast<int32_t>(cuEventSynchronize(e))};
+}
 
-    // Translate function handle
-    CUfunction real_func = reinterpret_cast<CUfunction>(g_vhandles.translate(func_handle));
-    if (!real_func) {
-        ret.result = static_cast<int32_t>(CUDA_ERROR_INVALID_VALUE);
-        return ret;
-    }
+// cuLaunchKernel: translate the function + stream handles, read kernel args
+// from the mirrored client memory, and translate any device pointers in args.
+LaunchKernelRet launch_kernel(
+    uint64_t func_handle,
+    uint32_t grid_x, uint32_t grid_y, uint32_t grid_z,
+    uint32_t block_x, uint32_t block_y, uint32_t block_z,
+    uint32_t shared_mem,
+    uint64_t stream_handle,
+    uint64_t args_addr, uint64_t args_byte_count) {
 
-    // Translate stream handle
-    CUstream real_stream = (stream_handle != 0)
+    CUfunction f = reinterpret_cast<CUfunction>(g_vhandles.translate(func_handle));
+    CUstream s = (stream_handle != 0)
         ? reinterpret_cast<CUstream>(g_vhandles.translate(stream_handle))
         : nullptr;
 
-    // Read kernel arguments from the host mirror
-    int n_args = args_byte_count / sizeof(std::uint64_t);
+    int n_args = static_cast<int>(args_byte_count / sizeof(std::uint64_t));
     std::vector<void*> arg_ptrs(n_args);
     std::vector<std::uint64_t> arg_vals(n_args);
 
     if (n_args > 0) {
-        auto mirror_addr = g_host_mirror.translate(
-            static_cast<std::uintptr_t>(args_client_addr));
-        if (mirror_addr) {
-            std::memcpy(arg_vals.data(),
-                       reinterpret_cast<void*>(*mirror_addr),
-                       args_byte_count);
+        auto mirror = g_host_mirror.translate(static_cast<std::uintptr_t>(args_addr));
+        if (mirror) {
+            std::memcpy(arg_vals.data(), reinterpret_cast<void*>(*mirror),
+                        static_cast<std::size_t>(args_byte_count));
         }
-
-        // Translate device pointers in args
+        // Translate any virtual device pointers among the args.
         for (int i = 0; i < n_args; i++) {
-            auto remote = g_ptr_map.to_remote(
-                static_cast<std::uintptr_t>(arg_vals[i]));
-            if (remote) {
-                arg_vals[i] = *remote;
+            if (zlink::is_virtual_handle(arg_vals[i])) {
+                arg_vals[i] = g_vhandles.translate(arg_vals[i]);
             }
             arg_ptrs[i] = &arg_vals[i];
         }
     }
 
-    CUresult res = cuLaunchKernel(real_func,
-                                   grid_dim_x, grid_dim_y, grid_dim_z,
-                                   block_dim_x, block_dim_y, block_dim_z,
-                                   shared_mem_bytes, real_stream,
-                                   arg_ptrs.data(), nullptr);
-
-    ret.result = static_cast<int32_t>(res);
-    return ret;
+    CUresult r = cuLaunchKernel(f,
+        grid_x, grid_y, grid_z,
+        block_x, block_y, block_z,
+        shared_mem, s,
+        arg_ptrs.data(), nullptr);
+    return {static_cast<int32_t>(r)};
 }
 
 } // namespace cuda_gen
 
 // ══════════════════════════════════════════════════════════════════════════
-// GENERATED SERVER HANDLERS
+// RPC server: dispatch + frame handling
 // ══════════════════════════════════════════════════════════════════════════
-// These provide implementations for all the function declarations in
-// gen_api.hpp. The hand-written overrides above are defined BEFORE this
-// include so they take precedence (same function names, same namespace).
-#include "codegen/gen_server.inc"
-
-// ══════════════════════════════════════════════════════════════════════════
-// RPC DISPATCH SERVER
-// ══════════════════════════════════════════════════════════════════════════
-// Uses zpp::bits server.serve() for automatic dispatch.
-// The gen_api.hpp binding maps function indices to cuda_gen::* handlers.
-// The server receives a request frame, creates a zpp::bits server context,
-// calls serve() which dispatches to the appropriate bound handler,
-// and sends the serialized response back.
-
 class cuda_rpc_server {
 public:
-    cuda_rpc_server() = default;
+    void serve(zlink::transport& tp) {
+        using namespace zlink;
 
-    void serve(zlink::transport& transport) {
-        std::cerr << "[server] CUDA RPC server (codegen, "
-                  << cuda_gen::func_index::mem_pool_destroy + 1
-                  << " functions) listening...\n";
+        auto ec = tp.listen("0.0.0.0", default_port);
+        if (ec) { std::cerr << "[server] listen failed: " << ec.message() << "\n"; return; }
+        std::cerr << "[server] listening on port " << default_port << "...\n";
 
-        auto ec = transport.listen("0.0.0.0", zlink::default_port);
-        if (ec) {
-            std::cerr << "[server] Listen failed: " << ec.message() << "\n";
-            return;
-        }
+        ec = tp.accept();
+        if (ec) { std::cerr << "[server] accept failed: " << ec.message() << "\n"; return; }
+        std::cerr << "[server] client connected\n";
 
-        ec = transport.accept();
-        if (ec) {
-            std::cerr << "[server] Accept failed: " << ec.message() << "\n";
-            return;
-        }
+        while (tp.is_connected()) {
+            frame req;
+            ec = tp.receive(req);
+            if (ec) { std::cerr << "[server] recv error: " << ec.message() << "\n"; break; }
 
-        std::cerr << "[server] Client connected\n";
-
-        while (transport.is_connected()) {
-            zlink::frame req_frame;
-            ec = transport.receive(req_frame);
-            if (ec) {
-                std::cerr << "[server] Receive error: " << ec.message() << "\n";
-                break;
-            }
-
-            // Handle memory operations (host_sync, host_read)
-            if (req_frame.type == zlink::frame_type::memory_op) {
-                handle_memory_op(transport, req_frame);
-                continue;
-            }
-
-            // Handle RPC request via zpp::bits dispatch
-            if (req_frame.type == zlink::frame_type::request) {
-                handle_rpc_request(transport, req_frame);
-            }
-
-            // Handle pipeline request (batched calls)
-            if (req_frame.type == zlink::frame_type::pipeline_request) {
-                handle_pipeline_request(transport, req_frame);
+            if (req.type == frame_type::memory_op) {
+                handle_memory_op(tp, req);
+            } else if (req.type == frame_type::request) {
+                handle_request(tp, req);
+            } else if (req.type == frame_type::pipeline_request) {
+                handle_pipeline_request(tp, req);
+            } else if (req.type == frame_type::pipeline_mem) {
+                handle_pipeline_mem(tp, req);
+            } else {
+                std::cerr << "[server] unknown frame type 0x"
+                          << std::hex << static_cast<int>(req.type) << std::dec << "\n";
             }
         }
-
-        std::cerr << "[server] Client disconnected\n";
+        std::cerr << "[server] client disconnected\n";
     }
 
 private:
-    void handle_memory_op(zlink::transport& transport, const zlink::frame& req_frame) {
-        if (req_frame.payload.size() < sizeof(zlink::mem_request)) return;
-
-        zlink::mem_request req;
-        std::memcpy(&req, req_frame.payload.data(), sizeof(req));
-
-        zlink::frame resp_frame;
-        resp_frame.call_id = 0;
-        resp_frame.type = zlink::frame_type::memory_op;
-
-        if (req.op == zlink::mem_op::host_sync) {
-            // Client is syncing host memory to us
-            auto data_span = std::span<const std::byte>(
-                req_frame.payload.data() + sizeof(req),
-                req_frame.payload.size() - sizeof(req));
-            g_host_mirror.sync_page(req.remote_addr, data_span);
-
-            zlink::mem_response resp;
-            resp.status = zlink::error_code::ok;
-            resp.size = data_span.size();
-            resp.remote_addr = req.remote_addr;
-            resp_frame.payload.resize(sizeof(resp));
-            std::memcpy(resp_frame.payload.data(), &resp, sizeof(resp));
-            transport.send(resp_frame);
-        }
-        else if (req.op == zlink::mem_op::host_read) {
-            // Client wants to read back from mirrored memory
-            auto mirror_addr = g_host_mirror.translate(req.remote_addr);
-
-            zlink::mem_response resp;
-            resp.status = zlink::error_code::ok;
-            resp.remote_addr = req.remote_addr;
-
-            if (mirror_addr) {
-                resp.size = req.size;
-                resp_frame.payload.resize(sizeof(resp) + req.size);
-                std::memcpy(resp_frame.payload.data(), &resp, sizeof(resp));
-                std::memcpy(resp_frame.payload.data() + sizeof(resp),
-                           reinterpret_cast<void*>(*mirror_addr), req.size);
-            } else {
-                resp.size = 0;
-                resp.status = zlink::error_code::not_found;
-                resp_frame.payload.resize(sizeof(resp));
-                std::memcpy(resp_frame.payload.data(), &resp, sizeof(resp));
-            }
-
-            transport.send(resp_frame);
-        }
-    }
-
-    void handle_rpc_request(zlink::transport& transport, const zlink::frame& req_frame) {
+    // ── Plain single-RPC request ──────────────────────────────────────
+    void handle_request(zlink::transport& tp, const zlink::frame& req) {
         using namespace zpp::bits;
-
-        // Load request data into a fresh context
         auto [data, in, out] = data_in_out();
-        data.assign(req_frame.payload.begin(), req_frame.payload.end());
-
-        // Create server context and dispatch
-        cuda_gen::cuda_gen_rpc::server server{in, out};
-
-        // Reset handle production flag before dispatch
+        data.assign(req.payload.begin(), req.payload.end());
         g_has_produced_handle = false;
 
-        // serve() deserializes the function index, calls the bound handler,
-        // and serializes the response into the data buffer
+        cuda_gen::cuda_gen_rpc::server server{in, out};
         auto result = server.serve();
         if (failure(result)) {
-            std::cerr << "[server] RPC dispatch failed\n";
-            // Send error response
-            zlink::frame resp_frame;
-            resp_frame.call_id = req_frame.call_id;
-            resp_frame.type = zlink::frame_type::request;
-            // Return a generic error
-            int32_t error_result = static_cast<int32_t>(CUDA_ERROR_INVALID_VALUE);
-            resp_frame.payload.resize(sizeof(error_result));
-            std::memcpy(resp_frame.payload.data(), &error_result, sizeof(error_result));
-            transport.send(resp_frame);
+            std::cerr << "[server] dispatch failed\n";
+            zlink::frame resp;
+            resp.call_id = req.call_id;
+            resp.type = zlink::frame_type::response;
+            int32_t err = static_cast<int32_t>(CUDA_ERROR_INVALID_VALUE);
+            resp.payload.resize(sizeof(err));
+            std::memcpy(resp.payload.data(), &err, sizeof(err));
+            tp.send(resp);
             return;
         }
-
-        // Send the serialized response back
-        zlink::frame resp_frame;
-        resp_frame.call_id = req_frame.call_id;
-        resp_frame.type = zlink::frame_type::request;
-        resp_frame.payload.assign(data.begin(), data.end());
-        transport.send(resp_frame);
+        send_response(tp, req.call_id, zlink::frame_type::response, data);
     }
 
-    void handle_pipeline_request(zlink::transport& transport, const zlink::frame& req_frame) {
-        // Pipeline request: batch of serialized RPC calls
-        // Format: [4B count] [4B len1][req1_data] [4B len2][req2_data] ...
-        // Process each call in order, serialize responses similarly
-
-        if (req_frame.payload.size() < 4) return;
+    // ── Pipeline request (batch, no handle manifest / no inline sync) ──
+    void handle_pipeline_request(zlink::transport& tp, const zlink::frame& req) {
+        using namespace zpp::bits;
+        if (req.payload.size() < 4) return;
 
         std::uint32_t count = 0;
-        std::memcpy(&count, req_frame.payload.data(), 4);
+        std::memcpy(&count, req.payload.data(), 4);
+        std::size_t off = 4;
 
-        std::size_t offset = 4;
-
-        // Response buffer
         std::vector<std::byte> resp_payload;
+        resp_payload.resize(4);
         std::uint32_t resp_count = 0;
-        resp_payload.resize(4); // Space for count
 
-        for (std::uint32_t i = 0; i < count && offset + 4 <= req_frame.payload.size(); i++) {
+        for (std::uint32_t i = 0; i < count && off + 4 <= req.payload.size(); ++i) {
             std::uint32_t len = 0;
-            std::memcpy(&len, req_frame.payload.data() + offset, 4);
-            offset += 4;
+            std::memcpy(&len, req.payload.data() + off, 4); off += 4;
+            if (off + len > req.payload.size()) break;
 
-            if (offset + len > req_frame.payload.size()) break;
-
-            // Dispatch this individual request
-            using namespace zpp::bits;
             auto [data, in, out] = data_in_out();
-            data.assign(req_frame.payload.begin() + offset,
-                        req_frame.payload.begin() + offset + len);
+            data.assign(req.payload.begin() + off,
+                        req.payload.begin() + off + len);
+            off += len;
 
             g_has_produced_handle = false;
-
             cuda_gen::cuda_gen_rpc::server server{in, out};
-            auto result = server.serve();
+            (void)server.serve();
 
-            offset += len;
-
-            // Serialize response
             std::uint32_t resp_len = static_cast<std::uint32_t>(data.size());
-            std::size_t old_size = resp_payload.size();
-            resp_payload.resize(old_size + 4 + resp_len);
-            std::memcpy(resp_payload.data() + old_size, &resp_len, 4);
-            std::memcpy(resp_payload.data() + old_size + 4, data.data(), resp_len);
-            resp_count++;
+            std::size_t prev = resp_payload.size();
+            resp_payload.resize(prev + 4 + resp_len);
+            std::memcpy(resp_payload.data() + prev, &resp_len, 4);
+            std::memcpy(resp_payload.data() + prev + 4, data.data(), resp_len);
+            ++resp_count;
+        }
+        std::memcpy(resp_payload.data(), &resp_count, 4);
+        send_response(tp, req.call_id, zlink::frame_type::pipeline_response, resp_payload);
+    }
+
+    // ── Pipeline_mem: the full virtual-handle + inline-sync path ───────
+    // Request format (see cuda_pipeline.hpp):
+    //   [4B sync_count]
+    //   per sync: [8B addr][8B original_size][1B comp_flag][4B data_size][data...]
+    //   [4B rpc_count]
+    //   per rpc:  [4B len][rpc_bytes]
+    //   [4B read_count]
+    //   per read: [8B addr][8B size]
+    //   [handle_manifest: 4B count + N × handle_manifest_entry]
+    //
+    // Response format:
+    //   [4B rpc_count] per rpc: [4B len][resp_bytes]
+    //   [4B read_count] per read: [4B data_len][1B comp_flag][data...]
+    //
+    // The manifest maps call_index → virtual_id. We parse it BEFORE running
+    // RPCs so that when a handler produces a handle, we can immediately
+    // register it under the virtual_id (not the call_index). This lets
+    // later RPCs in the same batch translate the virtual handle correctly.
+    void handle_pipeline_mem(zlink::transport& tp, const zlink::frame& req) {
+        using namespace zpp::bits;
+        auto* p = req.payload.data();
+        auto total = req.payload.size();
+        std::size_t off = 0;
+
+        // ── 1. Apply host syncs (before RPCs, in order) ──
+        std::uint32_t sync_count = 0;
+        std::memcpy(&sync_count, p + off, 4); off += 4;
+
+        for (std::uint32_t i = 0; i < sync_count && off + 21 <= total; ++i) {
+            std::uint64_t addr = 0, orig_sz = 0;
+            std::uint8_t comp_flag = 0;
+            std::uint32_t data_size = 0;
+            std::memcpy(&addr, p + off, 8); off += 8;
+            std::memcpy(&orig_sz, p + off, 8); off += 8;
+            std::memcpy(&comp_flag, p + off, 1); off += 1;
+            std::memcpy(&data_size, p + off, 4); off += 4;
+            if (off + data_size > total) break;
+
+            std::vector<std::byte> sync_data;
+            if (comp_flag == zlink::comp_flag_lz4) {
+                sync_data = zlink::decompress(
+                    std::span<const std::byte>(p + off, data_size),
+                    comp_flag, static_cast<std::size_t>(orig_sz));
+            } else {
+                sync_data.assign(p + off, p + off + data_size);
+            }
+            off += data_size;
+            g_host_mirror.sync_page(static_cast<std::uintptr_t>(addr),
+                std::span<const std::byte>(sync_data.data(), sync_data.size()));
         }
 
-        // Write response count
-        std::memcpy(resp_payload.data(), &resp_count, 4);
+        // ── 2. Parse the handle manifest BEFORE processing RPCs.
+        //    The manifest maps call_index → virtual_id. We need this mapping
+        //    during RPC processing so that produced handles are registered
+        //    under their virtual_id immediately, letting subsequent RPCs in
+        //    the same batch translate virtual handles correctly.
+        //    The frame layout is: syncs, RPCs, reads, manifest. We scan
+        //    forward to locate the manifest, then restart to process RPCs.
 
-        zlink::frame resp_frame;
-        resp_frame.call_id = req_frame.call_id;
-        resp_frame.type = zlink::frame_type::pipeline_response;
-        resp_frame.payload = resp_payload;
-        transport.send(resp_frame);
+        std::uint32_t rpc_count = 0;
+        std::memcpy(&rpc_count, p + off, 4); off += 4;
+
+        // Record RPC start, then skip past RPCs to reach reads
+        std::size_t rpc_start = off;
+        for (std::uint32_t i = 0; i < rpc_count && off + 4 <= total; ++i) {
+            std::uint32_t len = 0;
+            std::memcpy(&len, p + off, 4); off += 4;
+            off += len;
+        }
+
+        // Skip past reads (save start offset for later processing)
+        std::uint32_t read_count = 0;
+        std::size_t reads_start = off;
+        if (off + 4 <= total) {
+            std::memcpy(&read_count, p + off, 4); off += 4;
+        }
+        for (std::uint32_t i = 0; i < read_count && off + 16 <= total; ++i) {
+            off += 16;  // skip [8B addr][8B size]
+        }
+
+        // Parse manifest
+        std::vector<zlink::handle_manifest_entry> manifest;
+        if (off + 4 <= total) {
+            std::size_t manifest_bytes = 0;
+            manifest = zlink::parse_handle_manifest(
+                std::span<const std::byte>(p + off, total - off), manifest_bytes);
+        }
+
+        // Build call_index → virtual_id lookup map
+        std::unordered_map<std::uint32_t, std::uint32_t> call_to_vhid;
+        for (const auto& entry : manifest) {
+            call_to_vhid[entry.call_index] = entry.virtual_id;
+        }
+
+        // ── 3. Process RPCs in order, registering produced handles ──
+        //    Now that we know the call_index → virtual_id mapping, we register
+        //    each produced handle under its virtual_id immediately, so that
+        //    subsequent RPCs in the same batch can translate it.
+        std::vector<std::byte> rpc_responses;
+        rpc_responses.resize(4);
+        std::uint32_t rpc_resp_count = 0;
+
+        off = rpc_start;
+        for (std::uint32_t i = 0; i < rpc_count && off + 4 <= total; ++i) {
+            std::uint32_t len = 0;
+            std::memcpy(&len, p + off, 4); off += 4;
+            if (off + len > total) break;
+
+            auto [data, in, out] = data_in_out();
+            data.assign(p + off, p + off + len);
+            off += len;
+
+            g_has_produced_handle = false;
+            cuda_gen::cuda_gen_rpc::server server{in, out};
+            (void)server.serve();
+
+            if (g_has_produced_handle) {
+                std::uint32_t reg_id = i;
+                auto it = call_to_vhid.find(i);
+                if (it != call_to_vhid.end()) reg_id = it->second;
+                g_vhandles.register_handle(reg_id, g_last_produced_handle);
+            }
+
+            std::uint32_t resp_len = static_cast<std::uint32_t>(data.size());
+            std::size_t prev = rpc_responses.size();
+            rpc_responses.resize(prev + 4 + resp_len);
+            std::memcpy(rpc_responses.data() + prev, &resp_len, 4);
+            std::memcpy(rpc_responses.data() + prev + 4, data.data(), resp_len);
+            ++rpc_resp_count;
+        }
+        std::memcpy(rpc_responses.data(), &rpc_resp_count, 4);
+
+        // ── 4. Fulfill read requests from the host mirror ──
+        std::vector<std::byte> read_responses;
+        read_responses.resize(4);
+        std::uint32_t read_resp_count = 0;
+
+        off = reads_start + 4;  // skip read_count, go to first read entry
+        for (std::uint32_t i = 0; i < read_count && off + 16 <= total; ++i) {
+            std::uint64_t addr = 0, sz = 0;
+            std::memcpy(&addr, p + off, 8); off += 8;
+            std::memcpy(&sz, p + off, 8); off += 8;
+
+            std::vector<std::byte> mirror_data(static_cast<std::size_t>(sz), std::byte{0});
+            auto mirror_addr = g_host_mirror.translate(static_cast<std::uintptr_t>(addr));
+            if (mirror_addr && sz > 0) {
+                std::memcpy(mirror_data.data(),
+                    reinterpret_cast<const void*>(*mirror_addr),
+                    static_cast<std::size_t>(sz));
+            }
+
+            auto compressed = zlink::compress(
+                std::span<const std::byte>(mirror_data.data(),
+                                           static_cast<std::size_t>(sz)));
+
+            std::size_t data_field = (compressed.comp_flag == zlink::comp_flag_lz4)
+                ? 8 + compressed.data.size()
+                : compressed.data.size();
+            std::uint32_t total_len = static_cast<std::uint32_t>(1 + data_field);
+
+            std::size_t prev = read_responses.size();
+            read_responses.resize(prev + 4 + total_len);
+            std::memcpy(read_responses.data() + prev, &total_len, 4);
+            std::size_t w = prev + 4;
+            std::memcpy(read_responses.data() + w, &compressed.comp_flag, 1); w += 1;
+            if (compressed.comp_flag == zlink::comp_flag_lz4) {
+                std::uint64_t orig = compressed.original_size;
+                std::memcpy(read_responses.data() + w, &orig, 8); w += 8;
+                std::memcpy(read_responses.data() + w, compressed.data.data(),
+                            compressed.data.size());
+            } else {
+                std::memcpy(read_responses.data() + w, compressed.data.data(),
+                            compressed.data.size());
+            }
+            ++read_resp_count;
+        }
+        std::memcpy(read_responses.data(), &read_resp_count, 4);
+
+        // ── 5. Combine and send ──
+        std::vector<std::byte> resp_payload;
+        resp_payload.reserve(rpc_responses.size() + read_responses.size());
+        resp_payload.insert(resp_payload.end(), rpc_responses.begin(), rpc_responses.end());
+        resp_payload.insert(resp_payload.end(), read_responses.begin(), read_responses.end());
+
+        send_response(tp, req.call_id, zlink::frame_type::pipeline_response, resp_payload);
+    }
+
+    // ── Memory op (host_sync / host_read outside the pipeline) ─────────
+    void handle_memory_op(zlink::transport& tp, const zlink::frame& req) {
+        if (req.payload.size() < sizeof(zlink::mem_request)) return;
+        zlink::mem_request mr;
+        std::memcpy(&mr, req.payload.data(), sizeof(mr));
+
+        zlink::frame resp;
+        resp.call_id = req.call_id;
+        resp.type = zlink::frame_type::memory_reply;
+
+        if (mr.op == zlink::mem_op::host_sync) {
+            auto data_span = std::span<const std::byte>(
+                req.payload.data() + sizeof(mr),
+                req.payload.size() - sizeof(mr));
+            g_host_mirror.sync_page(mr.remote_addr, data_span);
+            zlink::mem_response mresp{zlink::error_code::ok, data_span.size(), mr.remote_addr};
+            resp.payload.resize(sizeof(mresp));
+            std::memcpy(resp.payload.data(), &mresp, sizeof(mresp));
+        } else if (mr.op == zlink::mem_op::host_read) {
+            auto mirror = g_host_mirror.translate(mr.remote_addr);
+            zlink::mem_response mresp{zlink::error_code::ok, 0, mr.remote_addr};
+            if (mirror) {
+                mresp.size = mr.size;
+                resp.payload.resize(sizeof(mresp) + mr.size);
+                std::memcpy(resp.payload.data(), &mresp, sizeof(mresp));
+                std::memcpy(resp.payload.data() + sizeof(mresp),
+                            reinterpret_cast<void*>(*mirror), mr.size);
+            } else {
+                mresp.status = zlink::error_code::pointer_not_found;
+                resp.payload.resize(sizeof(mresp));
+                std::memcpy(resp.payload.data(), &mresp, sizeof(mresp));
+            }
+        } else {
+            return;
+        }
+        tp.send(resp);
+    }
+
+    void send_response(zlink::transport& tp, std::uint32_t call_id,
+                       zlink::frame_type type, std::span<const std::byte> payload) {
+        zlink::frame resp;
+        resp.call_id = call_id;
+        resp.type = type;
+        resp.payload.assign(payload.begin(), payload.end());
+        tp.send(resp);
     }
 };
 
 // ══════════════════════════════════════════════════════════════════════════
 // Main
 // ══════════════════════════════════════════════════════════════════════════
-int main(int argc, char* argv[]) {
+int main() {
     std::cerr << "zlink CUDA RPC Server\n";
-    std::cerr << "  Covers all CUDA Driver API functions (CUDA 12.4+)\n";
-    std::cerr << "  Client/server from same zlink build — no protocol versioning\n";
 
-    // Initialize CUDA
-    CUresult res = cuInit(0);
-    if (res != CUDA_SUCCESS) {
-        std::cerr << "[server] cuInit failed: " << res << "\n";
-        return 1;
-    }
+    CUresult r = cuInit(0);
+    if (r != CUDA_SUCCESS) { std::cerr << "[server] cuInit failed: " << r << "\n"; return 1; }
 
-    int device_count = 0;
-    cuDeviceGetCount(&device_count);
-    std::cerr << "[server] Found " << device_count << " CUDA device(s)\n";
-
-    if (device_count == 0) {
-        std::cerr << "[server] No CUDA devices found\n";
-        return 1;
-    }
+    int dev_count = 0;
+    cuDeviceGetCount(&dev_count);
+    std::cerr << "[server] " << dev_count << " CUDA device(s)\n";
+    if (dev_count == 0) { std::cerr << "[server] no CUDA devices\n"; return 1; }
 
     cuda_rpc_server server;
-    auto transport = zlink::make_transport(zlink::transport_kind::tcp);
-    server.serve(*transport);
-
+    auto tp = zlink::make_transport(zlink::transport_kind::tcp);
+    server.serve(*tp);
     return 0;
 }

@@ -58,14 +58,21 @@ Terminal 2 (client):
 
 ### Example: CUDA Pipeline with Virtual Handles
 
+Build with CUDA examples (server requires the CUDA toolkit):
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DZLINK_CUDA_EXAMPLES=ON
+cmake --build build -j$(nproc)
+```
+
 Terminal 1 (GPU server):
 ```bash
-./build/cuda_test_server 14833
+./build/examples/cuda/cuda_server
 ```
 
 Terminal 2 (client):
 ```bash
-./build/cuda_test_client 127.0.0.1 14833
+./build/examples/cuda/cuda_client 127.0.0.1 14833
 ```
 
 ## Documentation
@@ -145,7 +152,11 @@ zlink/
 ├── src/                    # Implementation files
 ├── examples/
 │   ├── libmath/            # Remote math example
-│   └── cuda/               # CUDA examples (test client/server)
+│   └── cuda/               # CUDA RPC server + pipeline client
+│       ├── cuda_api.hpp    # Hand-written CUDA Driver API RPC declarations
+│       ├── cuda_server.cpp # GPU server: real CUDA calls + pipeline_mem handler
+│       ├── cuda_client.cpp # Pipeline client: virtual handles + readback test
+│       └── CMakeLists.txt  # Builds cuda_server (needs CUDA) + cuda_client
 ├── tests/                  # Unit tests
 ├── docs/                   # Documentation
 ├── sim/                    # Performance simulation + charts
