@@ -181,3 +181,27 @@ Environment variables (alternative to config file):
 | `ZLINK_CUDA_EXAMPLES` | `OFF` | Enable CUDA server + client targets (requires CUDAToolkit for server) |
 
 The build uses `-Wall -Wextra -Wpedantic` and `-O2` in Release mode.
+
+
+## Configuration Constants
+
+Port and frame size constants are in `include/zlink/config.hpp`:
+
+```cpp
+inline constexpr std::uint16_t default_port = 14833;
+inline constexpr std::size_t   max_frame_size = 64 * 1024 * 1024;  // 64 MiB
+```
+
+Compression thresholds are in `include/zlink/compress.hpp`:
+
+```cpp
+inline constexpr std::size_t compress_threshold = 4096;     // 4 KB minimum
+inline constexpr double compress_ratio_threshold = 0.9;      // Must save >= 10%
+```
+
+## Running Tests
+
+```bash
+cd build
+ctest --output-on-failure
+```

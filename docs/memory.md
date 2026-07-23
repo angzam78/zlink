@@ -249,10 +249,64 @@ For `cuMemcpyDtoH(dstHost, src, 1024)` (output buffer):
 ## Memory Operation Protocol
 
 Memory operations use `frame_type::memory_op` (0x10) and
-`frame_type::memory_reply` (0x11) frames. See [WIRE_PROTOCOL.md](WIRE_PROTOCOL.md)
+`frame_type::memory_reply` (0x11) frames. See [wire-protocol.md](wire-protocol.md)
 for the frame format details.
 
 The `host_sync` (0x07) operation is the most important for CUDA pipelining.
 It allows the client to push host data to the server's mirror region without
 a separate round-trip — the data is packed inline in the `pipeline_mem`
 frame.
+
+
+## Memory Operations
+
+Defined in `include/zlink/memory.hpp`:
+
+| Operation | Code | Direction | Description |
+|-----------|------|-----------|-------------|
+| `read` | 0x01 | Server→Client | Read from remote memory |
+| `write` | 0x02 | Client→Server | Write to remote memory |
+| `alloc` | 0x03 | Client→Server | Allocate remote memory |
+| `free_op` | 0x04 | Client→Server | Free remote memory |
+| `sync` | 0x05 | Bidirectional | Flush dirty / invalidate |
+| `invalidate` | 0x06 | Server→Client | Invalidate cached pages |
+| `host_sync` | 0x07 | Client→Server | Sync client host page to server mirror |
+| `host_read` | 0x08 | Server→Client | Read from mirrored client host memory |
+
+## Inline Memory Ops in pipeline_mem
+
+The `pipeline_mem` frame (frame_type 0x06) eliminates separate round-trips for
+memory operations by inlining them into the pipeline batch:
+
+### Without pipeline_mem (3 round-trips for cuMemcpyHtoD):
+
+```
+1. host_sync frame → server mirrors data    [1 RT]
+2. request frame   → server calls cuMemcpyHtoD  [1 RT]
+3. response frame  → client gets CUresult    [1 RT]
+```
+
+### With pipeline_mem (1 round-trip):
+
+```
+1. pipeline_mem frame →
+   [sync: host data][rpc: cuMemcpyHtoD call]
+   → server processes: apply sync, execute call
+   → response: [rpc result]                 [1 RT]
+```
+
+### With pipeline_mem + readback for cuMemcpyDtoH (1 round-trip):
+
+```
+1. pipeline_mem frame →
+   [sync: zero-fill dest buffer][rpc: cuMemcpyDtoH call][read: dest addr+size]
+   → server processes: apply sync, execute DtoH, read mirror data
+   → response: [rpc result][read data]      [1 RT]
+```
+
+## Implementation: `src/memory_region.cpp`
+
+The `sync_page()` method auto-registers mirror regions. When the server receives
+a `host_sync` for an address that isn't in a registered region, it automatically
+allocates a new mmap region to cover the address range. This allows the client
+to sync any host memory without prior registration.

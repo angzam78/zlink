@@ -79,14 +79,17 @@ Terminal 2 (client):
 
 | Document | Description |
 |----------|-------------|
-| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | System architecture and component overview |
-| [CUDA_PIPELINE.md](docs/CUDA_PIPELINE.md) | Virtual handles and dependency-aware pipelining |
-| [MANAGED_PIPELINE.md](docs/MANAGED_PIPELINE.md) | Managed pipeline architecture (prefetch, write-behind, multiplexed transport) |
-| [MANAGED_PIPELINE_INTEGRATION.md](docs/MANAGED_PIPELINE_INTEGRATION.md) | Step-by-step integration guide for managed pipeline |
-| [WIRE_PROTOCOL.md](docs/WIRE_PROTOCOL.md) | Frame format and network protocol |
-| [MEMORY_SUBSYSTEM.md](docs/MEMORY_SUBSYSTEM.md) | Remote memory, host mirror, chunk cache |
-| [POINTER_MARSHALLING.md](docs/POINTER_MARSHALLING.md) | How pointers cross the network boundary |
-| [BUILDING.md](docs/BUILDING.md) | Build instructions and running examples |
+| [architecture.md](docs/architecture.md) | System architecture and component overview |
+| [building.md](docs/building.md) | Build instructions and running examples |
+| [cuda-pipeline.md](docs/cuda-pipeline.md) | Virtual handles and dependency-aware pipelining |
+| [wire-protocol.md](docs/wire-protocol.md) | Frame format and network protocol |
+| [memory.md](docs/memory.md) | Remote memory, host mirror, chunk cache |
+| [pointer-marshalling.md](docs/pointer-marshalling.md) | How pointers cross the network boundary |
+| [compression.md](docs/compression.md) | LZ4 compression in pipeline frames |
+| [rpc-framework.md](docs/rpc-framework.md) | zpp_bits RPC engine and API declaration |
+| [managed-pipeline.md](docs/managed-pipeline.md) | Managed pipeline architecture (prefetch, write-behind, multiplexed transport) |
+| [managed-pipeline-integration.md](docs/managed-pipeline-integration.md) | Step-by-step integration guide for managed pipeline |
+| [pytorch-over-zlink.md](docs/pytorch-over-zlink.md) | Planned PyTorch integration via LD_PRELOAD shim |
 
 ## Pipeline Performance
 
@@ -122,7 +125,7 @@ Each frame on the wire:
 The `pipeline_mem` frame type (`0x06`) combines host sync data, RPC calls,
 read requests, and the virtual handle manifest into a single round-trip.
 
-See [WIRE_PROTOCOL.md](docs/WIRE_PROTOCOL.md) for full protocol details.
+See [wire-protocol.md](docs/wire-protocol.md) for full protocol details.
 
 ## Project Structure
 

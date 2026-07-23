@@ -150,7 +150,7 @@ the mirror.
 ## Virtual Handles for Device Pointers
 
 Device pointers are handled differently from host pointers. They use the
-virtual handle system (see [CUDA_PIPELINE.md](CUDA_PIPELINE.md) for full
+virtual handle system (see [cuda-pipeline.md](cuda-pipeline.md) for full
 details):
 
 - `cuMemAlloc` returns a virtual handle (VH) instead of a real device
